@@ -33,3 +33,14 @@ gcloud storage buckets create "gs://${BUCKET}" \
   --location="${REGION^^}" \
   --uniform-bucket-level-access \
   --public-access-prevention
+
+# --- 4. BigQuery datasets (one per layer, same region as the bucket) -----------
+declare -A DATASETS=(
+  [bronze]="Raw records loaded from source files, append-only"
+  [silver]="Cleaned observations and CVE history"
+  [gold]="Daily review report and enrichment gap"
+  [ops]="Pipeline operations: manifest, watermarks, report runs"
+)
+for ds in "${!DATASETS[@]}"; do
+  bq --location="$REGION" mk --dataset --description="${DATASETS[$ds]}" "${PROJECT_ID}:${ds}"
+done
