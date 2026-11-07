@@ -67,4 +67,4 @@ done
 say "Project-level roles now:"
 gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" \
   --filter="bindings.members:serviceAccount AND bindings.members:${PROJECT_ID}.iam" \
-  --format="table(bindings.members.split(':').slice(1:).join(''), bindings.role)"
+  --format="table(bindings.members, bindings.role)"
