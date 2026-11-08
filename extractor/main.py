@@ -287,6 +287,17 @@ class Lock:
         except PreconditionFailed:
             self.blob.reload()
             age = now() - self.blob.updated
+            try:
+                owner = json.loads(self.blob.download_as_bytes(
+                    if_generation_match=self.blob.generation)).get("run_id")
+            except Exception:  # noqa: BLE001 - unreadable lock: treat as someone else's
+                owner = None
+            if owner == RUN_ID:
+                # Our own lock: a retried upload whose first attempt already succeeded,
+                # or a task retry of this same execution after a crash. Safe to adopt.
+                info("lock already held by this run, adopting", lock=self.blob.name, age=str(age))
+                self.gen = self.blob.generation
+                return self
             if age < LOCK_STALE_AFTER:
                 raise RuntimeError(f"another run holds {self.blob.name} (age {age})")
             info("taking over stale lock", lock=self.blob.name, age=str(age))
