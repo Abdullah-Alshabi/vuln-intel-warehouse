@@ -6,7 +6,8 @@
 #
 #   build-sa     -> roles/run.developer          on the job        (CD: update the image)
 #   build-sa     -> roles/iam.serviceAccountUser on extractor-sa   (deploy a job that runs as extractor-sa)
-#   scheduler-sa -> roles/run.invoker            on the job        (start executions, with overrides)
+#   scheduler-sa -> roles/run.jobsExecutorWithOverrides on the job (start executions with a mode argument)
+#   (roles/run.invoker has run.jobs.run but NOT run.jobs.runWithOverrides, so it is removed)
 # =============================================================================
 set -euo pipefail
 
@@ -29,8 +30,11 @@ echo "  build-sa -> roles/iam.serviceAccountUser (on extractor-sa only)"
 
 say "scheduler-sa can start the job"
 gcloud run jobs add-iam-policy-binding "$JOB" --region="$REGION" \
-  --member="serviceAccount:$(sa scheduler-sa)" --role="roles/run.invoker" >/dev/null
-echo "  scheduler-sa -> roles/run.invoker (job ${JOB})"
+  --member="serviceAccount:$(sa scheduler-sa)" --role="roles/run.jobsExecutorWithOverrides" >/dev/null
+echo "  scheduler-sa -> roles/run.jobsExecutorWithOverrides (job ${JOB})"
+gcloud run jobs remove-iam-policy-binding "$JOB" --region="$REGION" \
+  --member="serviceAccount:$(sa scheduler-sa)" --role="roles/run.invoker" >/dev/null 2>&1 \
+  && echo "  scheduler-sa: removed roles/run.invoker (not enough for overrides)" || true
 
 say "Check: job configuration (no secret values are printed)"
 gcloud run jobs describe "$JOB" --region="$REGION" --format="yaml(
