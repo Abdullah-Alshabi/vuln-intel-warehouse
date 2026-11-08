@@ -2,20 +2,25 @@
 Vulnerability Intelligence Warehouse: extractor (Cloud Run Job).
 
 Modes (first CLI argument, else env MODE):
-  cvelist_baseline   once: midnight snapshot of CVE.org cvelistV5 (recovery: run again)
+  cvelist_baseline   daily: midnight snapshot of CVE.org cvelistV5 (closes the end-of-day delta gap)
   hourly             cvelistV5 cumulative delta (since midnight UTC)
   daily              NVD (incremental by lastModified) + CISA KEV + EPSS, then Dataform
   nvd | kev | epss   one source on its own
-  epss_backfill      EPSS files for the EPSS_BACKFILL_DAYS days before today
+  epss_reprocess     rebuild EPSS from the files already in the raw layer (no download)
+  epss_backfill      dated EPSS files from COHORT_START to yesterday (skips files already processed)
 
 Every run:
+  - writes a started row and a finished row (succeeded/failed) to ops.ingest_runs
   - stores what it downloaded, byte for byte, in Cloud Storage (raw layer, never overwritten)
-  - loads only in-scope records into BigQuery bronze, and only records whose content is new
+  - loads records into BigQuery bronze, only records whose content is new
     (dedupe on (cve_id, record_hash) or the source's natural key)
-  - writes one row per file to ops.ingest_manifest and advances ops.source_watermarks
-    only after a fully successful pull
-  - holds a per-mode lock object in Cloud Storage so two runs never write the same source
-Scope: CVEs whose cveMetadata.datePublished (UTC) >= COHORT_START.
+  - observed_at = when we first had the file (raw object time); processed_at = when it was loaded
+  - writes one row per file to ops.ingest_manifest. A file counts as processed only for the
+    same target table and PROCESSOR_VERSION, so a new table or parser version re-processes it.
+  - advances ops.source_watermarks only after a fully successful pull
+  - holds a per-source lock object in Cloud Storage so two runs never write the same source
+Scope: cvelist and NVD keep CVEs whose cveMetadata.datePublished (UTC) >= COHORT_START.
+KEV and EPSS are kept whole (small, and independent of when a CVE reaches the cohort).
 """
 import csv
 import datetime as dt
@@ -44,7 +49,10 @@ COHORT_START = os.environ.get("COHORT_START", "2026-10-08")  # launch date minus
 NVD_API_KEY = os.environ.get("NVD_API_KEY", "").strip()      # from Secret Manager
 DATAFORM_REPO = os.environ.get("DATAFORM_REPO", "")           # empty = do not start Dataform
 DATAFORM_BRANCH = os.environ.get("DATAFORM_BRANCH", "main")
-EPSS_BACKFILL_DAYS = int(os.environ.get("EPSS_BACKFILL_DAYS", "30"))
+BRONZE = os.environ.get("BRONZE_DATASET", "bronze")          # overridable for integration tests
+OPS = os.environ.get("OPS_DATASET", "ops")
+GIT_SHA = os.environ.get("GIT_SHA", "unknown")                # set by Cloud Build on deploy
+PROCESSOR_VERSION = "2"                                       # bump to re-process stored files
 NVD_OVERLAP = dt.timedelta(hours=2)                           # re-read a little of the last window
 LOCK_STALE_AFTER = dt.timedelta(hours=3)
 
@@ -57,12 +65,14 @@ EPSS_DATED = "https://epss.empiricalsecurity.com/epss_scores-{day}.csv.gz"
 CVE_FILE = re.compile(r"(CVE-\d{4}-\d{4,})\.json$")
 SUPPORTED_DATA_VERSIONS = {"5.0", "5.1", "5.2"}
 
-MANIFEST = f"{PROJECT}.ops.ingest_manifest"
-WATERMARKS = f"{PROJECT}.ops.source_watermarks"
-T_CVELIST = f"{PROJECT}.bronze.cvelist_records"
-T_NVD = f"{PROJECT}.bronze.nvd_records"
-T_KEV = f"{PROJECT}.bronze.kev_records"
-T_EPSS = f"{PROJECT}.bronze.epss_scores"
+MANIFEST = f"{PROJECT}.{OPS}.ingest_manifest"
+WATERMARKS = f"{PROJECT}.{OPS}.source_watermarks"
+RUNS = f"{PROJECT}.{OPS}.ingest_runs"
+T_CVELIST = f"{PROJECT}.{BRONZE}.cvelist_records"
+T_NVD = f"{PROJECT}.{BRONZE}.nvd_records"
+T_KEV = f"{PROJECT}.{BRONZE}.kev_records"
+T_KEV_SNAP = f"{PROJECT}.{BRONZE}.kev_snapshots"   # full membership of every catalog version seen
+T_EPSS = f"{PROJECT}.{BRONZE}.epss_scores_v2"      # whole EPSS file (v1 was filtered to the cohort)
 
 RUN_ID = os.environ.get("CLOUD_RUN_EXECUTION") or f"local-{uuid.uuid4().hex[:8]}"
 MODE = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODE", "hourly")).lower()
@@ -130,15 +140,18 @@ def fetch(url, what, headers=None, timeout=300, stream_to=None):
     """GET with bounded retries. 4xx (other than 429) is not retried. Secrets never logged."""
     for attempt in range(1, 4):
         try:
-            r = http.get(url, headers=headers or {}, timeout=timeout, stream=bool(stream_to))
-            if r.status_code >= 400:
-                reason = r.headers.get("message") or r.text[:300]
-                raise RuntimeError(f"HTTP {r.status_code}: {reason}")
-            if stream_to:
-                for chunk in r.iter_content(8 * 1024 * 1024):
-                    stream_to.write(chunk)
-                return None
-            return r.content
+            with http.get(url, headers=headers or {}, timeout=timeout, stream=bool(stream_to)) as r:
+                if r.status_code >= 400:
+                    reason = r.headers.get("message") or r.text[:300]
+                    raise RuntimeError(f"HTTP {r.status_code}: {reason}")
+                if stream_to:
+                    stream_to.seek(0)      # a retry must not append to a partial download
+                    stream_to.truncate()
+                    for chunk in r.iter_content(8 * 1024 * 1024):
+                        stream_to.write(chunk)
+                    stream_to.flush()
+                    return None
+                return r.content
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             error("fetch failed", what=what, attempt=attempt, error=msg)
@@ -156,17 +169,25 @@ def schema(*cols):
 
 
 INGEST_COLS = [("run_id", "STRING"), ("batch_id", "STRING"), ("file_uri", "STRING"),
-               ("observed_at", "TIMESTAMP")]
+               ("observed_at", "TIMESTAMP"), ("processed_at", "TIMESTAMP")]
+# observed_at  = when we first had the source file (raw object creation time)
+# processed_at = when this row was loaded (differs from observed_at after a re-process)
 TABLES = {
     MANIFEST: (schema(("run_id", "STRING"), ("mode", "STRING"), ("source", "STRING"),
                       ("batch_id", "STRING"), ("request", "STRING"), ("file_uri", "STRING"),
                       ("sha256", "STRING"), ("bytes", "INT64"), ("records_seen", "INT64"),
                       ("records_in_scope", "INT64"), ("records_new", "INT64"),
                       ("status", "STRING"), ("detail", "STRING"),
-                      ("started_at", "TIMESTAMP"), ("finished_at", "TIMESTAMP")), "finished_at", None),
+                      ("started_at", "TIMESTAMP"), ("finished_at", "TIMESTAMP"),
+                      ("target", "STRING"), ("processor", "STRING"), ("records_failed", "INT64"),
+                      ("records_conflicting", "INT64"), ("acquired_at", "TIMESTAMP")),
+               "finished_at", None),
     WATERMARKS: (schema(("source", "STRING"), ("watermark", "STRING"), ("last_checked_at", "TIMESTAMP"),
                         ("last_changed_at", "TIMESTAMP"), ("run_id", "STRING"),
                         ("recorded_at", "TIMESTAMP")), "recorded_at", None),
+    RUNS: (schema(("run_id", "STRING"), ("mode", "STRING"), ("status", "STRING"), ("git_sha", "STRING"),
+                  ("processor", "STRING"), ("error", "STRING"), ("started_at", "TIMESTAMP"),
+                  ("finished_at", "TIMESTAMP"), ("recorded_at", "TIMESTAMP")), "recorded_at", None),
     T_CVELIST: (schema(("cve_id", "STRING"), ("state", "STRING"), ("data_version", "STRING"),
                        ("date_published", "TIMESTAMP"), ("date_updated", "TIMESTAMP"),
                        ("record_hash", "STRING"), ("record", "JSON"), *INGEST_COLS),
@@ -177,19 +198,36 @@ TABLES = {
     T_KEV: (schema(("cve_id", "STRING"), ("catalog_version", "STRING"), ("date_released", "TIMESTAMP"),
                    ("date_added", "DATE"), ("known_ransomware_campaign_use", "STRING"),
                    ("record_hash", "STRING"), ("record", "JSON"), *INGEST_COLS), "observed_at", ["cve_id"]),
+    T_KEV_SNAP: (schema(("catalog_version", "STRING"), ("cve_id", "STRING"), ("record_hash", "STRING"),
+                        ("batch_id", "STRING"), ("observed_at", "TIMESTAMP"), ("processed_at", "TIMESTAMP")),
+                 "observed_at", ["cve_id"]),
+    # Slim on purpose (~330k rows per day): file_uri and run_id are found through batch_id in the manifest.
     T_EPSS: (schema(("cve_id", "STRING"), ("epss", "FLOAT64"), ("percentile", "FLOAT64"),
-                    ("score_date", "DATE"), ("model_version", "STRING"), *INGEST_COLS),
+                    ("score_date", "DATE"), ("model_version", "STRING"), ("batch_id", "STRING"),
+                    ("observed_at", "TIMESTAMP"), ("processed_at", "TIMESTAMP")),
              "score_date", ["cve_id"]),
 }
 
 
 def ensure_tables():
+    """Create missing tables; add missing NULLABLE columns to existing ones (schema evolution)."""
     for table_id, (sch, part, cluster) in TABLES.items():
         t = bigquery.Table(table_id, schema=sch)
         t.time_partitioning = bigquery.TimePartitioning(field=part)
         if cluster:
             t.clustering_fields = cluster
-        bq.create_table(t, exists_ok=True)
+        t = bq.create_table(t, exists_ok=True)
+        have = {f.name for f in t.schema}
+        missing = [f for f in sch if f.name not in have]
+        if missing:
+            t.schema = list(t.schema) + missing
+            try:
+                bq.update_table(t, ["schema"])
+            except Exception:  # noqa: BLE001 - another run may have added them at the same moment
+                have = {f.name for f in bq.get_table(table_id).schema}
+                if any(f.name not in have for f in missing):
+                    raise
+            info("columns added", table=table_id, columns=[f.name for f in missing])
 
 
 def load_json_rows(table_id, rows, write="WRITE_APPEND"):
@@ -201,23 +239,42 @@ def load_json_rows(table_id, rows, write="WRITE_APPEND"):
     bq.load_table_from_file(io.BytesIO(data), table_id, job_config=cfg).result()
 
 
-def insert_new_only(table_id, rows, key_cols):
+def insert_sql(table_id, stage, key_cols, compare_cols=()):
+    """SQL used by insert_new_only (kept separate so it can be tested on its own).
+    Returns (conflict_count_sql | None, insert_sql)."""
+    cols = [f.name for f in TABLES[table_id][0]]
+    keys = ", ".join(key_cols)
+    on = " AND ".join(f"t.{c} = s.{c}" for c in key_cols)
+    # One row per key inside the batch too, chosen deterministically.
+    dedup = (f"SELECT * FROM `{stage}` QUALIFY ROW_NUMBER() OVER "
+             f"(PARTITION BY {keys} ORDER BY TO_JSON_STRING(STRUCT({', '.join(cols)}))) = 1")
+    conflict = None
+    if compare_cols:
+        diff = " OR ".join(f"t.{c} IS DISTINCT FROM s.{c}" for c in compare_cols)
+        conflict = f"SELECT COUNT(*) AS n FROM ({dedup}) s JOIN `{table_id}` t ON {on} WHERE {diff}"
+    insert = (f"INSERT INTO `{table_id}` ({', '.join(cols)}) "
+              f"SELECT {', '.join('s.' + c for c in cols)} FROM ({dedup}) s "
+              f"WHERE NOT EXISTS (SELECT 1 FROM `{table_id}` t WHERE {on})")
+    return conflict, insert
+
+
+def insert_new_only(table_id, rows, key_cols, compare_cols=()):
     """Load rows to a staging table, then insert only rows whose key is not in the target.
-    Returns how many rows were new. Re-running with the same input inserts nothing."""
+    Returns (new_rows, conflicting_rows). Re-running with the same input inserts nothing.
+    conflicting_rows: key already stored with different compare_cols values; the stored
+    value is kept and the caller reports the conflict instead of silently accepting it."""
     if not rows:
-        return 0
-    stage = f"{PROJECT}.bronze.stage_{table_id.split('.')[-1]}_{uuid.uuid4().hex[:8]}"
+        return 0, 0
+    stage = f"{PROJECT}.{BRONZE}.stage_{table_id.split('.')[-1]}_{uuid.uuid4().hex[:8]}"
     sch = TABLES[table_id][0]
     bq.create_table(bigquery.Table(stage, schema=sch))
     try:
         load_json_rows(stage, rows, write="WRITE_TRUNCATE")
-        on = " AND ".join(f"t.{c} = s.{c}" for c in key_cols)
-        cols = ", ".join(f.name for f in sch)
-        q = (f"INSERT INTO `{table_id}` ({cols}) SELECT {', '.join('s.' + f.name for f in sch)} "
-             f"FROM `{stage}` s WHERE NOT EXISTS (SELECT 1 FROM `{table_id}` t WHERE {on})")
-        job = bq.query(q)
+        conflict_q, insert_q = insert_sql(table_id, stage, key_cols, compare_cols)
+        conflicts = list(bq.query(conflict_q).result())[0].n if conflict_q else 0
+        job = bq.query(insert_q)
         job.result()
-        return job.num_dml_affected_rows or 0
+        return job.num_dml_affected_rows or 0, conflicts
     finally:
         bq.delete_table(stage, not_found_ok=True)
 
@@ -225,6 +282,7 @@ def insert_new_only(table_id, rows, key_cols):
 def manifest(**row):
     row.setdefault("run_id", RUN_ID)
     row.setdefault("mode", MODE)
+    row.setdefault("processor", PROCESSOR_VERSION)
     row.setdefault("finished_at", iso(now()))
     load_json_rows(MANIFEST, [row])
     info("manifest", **{k: v for k, v in row.items() if k not in ("run_id", "mode")})
@@ -246,16 +304,26 @@ def watermark_set(source, value, changed):
         "run_id": RUN_ID, "recorded_at": iso(now())}])
 
 
-def already_loaded(sha):
-    q = f"SELECT COUNT(*) n FROM `{MANIFEST}` WHERE sha256 = @h AND status IN ('loaded', 'unchanged')"
-    r = list(bq.query(q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("h", "STRING", sha)])).result())
+DONE_STATUSES = ("loaded", "partial", "conflicts")
+
+
+def already_loaded(sha, target):
+    """True only if this exact file was processed into this target by this processor version.
+    A new target table or a new PROCESSOR_VERSION therefore re-processes stored files."""
+    q = (f"SELECT COUNT(*) n FROM `{MANIFEST}` WHERE sha256 = @h AND target = @t AND processor = @p "
+         f"AND status IN UNNEST(@s)")
+    r = list(bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("h", "STRING", sha),
+        bigquery.ScalarQueryParameter("t", "STRING", target),
+        bigquery.ScalarQueryParameter("p", "STRING", PROCESSOR_VERSION),
+        bigquery.ArrayQueryParameter("s", "STRING", list(DONE_STATUSES))])).result())
     return r[0].n > 0
 
 
 # ------------------------------------------------------------------ raw layer + lock
 def land(source, name, data=None, path=None, content_type="application/octet-stream"):
-    """Store bytes (or a local file) once; never overwrite an existing object."""
+    """Store bytes (or a local file) once; never overwrite an existing object.
+    Returns (uri, acquired_at): acquired_at is when the object was first stored."""
     day = now().strftime("%Y-%m-%d")
     blob = gcs.blob(f"raw/{source}/ingest_date={day}/{name}")
     try:
@@ -263,9 +331,12 @@ def land(source, name, data=None, path=None, content_type="application/octet-str
             blob.upload_from_filename(path, content_type=content_type, if_generation_match=0)
         else:
             blob.upload_from_string(data, content_type=content_type, if_generation_match=0)
+        acquired = now()
     except PreconditionFailed:
+        blob.reload()
+        acquired = blob.time_created
         info("raw object already stored", uri=f"gs://{BUCKET}/{blob.name}")
-    return f"gs://{BUCKET}/{blob.name}"
+    return f"gs://{BUCKET}/{blob.name}", acquired
 
 
 def quarantine(file_uri, reason):
@@ -314,46 +385,61 @@ class Lock:
 
 
 # ------------------------------------------------------------------ cvelistV5
-def cve_rows_from_zip(zf, batch_id, file_uri, observed_at):
-    """Yield (row | None, problem | None) for every CVE JSON member, in scope only."""
-    for info_ in zf.infolist():
-        m = CVE_FILE.search(info_.filename)
-        if not m:
-            continue
-        try:
-            rec = json.loads(zf.read(info_))
-        except Exception as e:  # noqa: BLE001
-            yield None, f"{info_.filename}: unreadable ({e})"
-            continue
-        if not isinstance(rec, dict) or "cveMetadata" not in rec:
-            yield None, f"{info_.filename}: not a CVE record"
-            continue
-        if rec.get("dataVersion") not in SUPPORTED_DATA_VERSIONS:
-            yield None, f"{info_.filename}: unsupported dataVersion {rec.get('dataVersion')}"
-            continue
-        meta = rec["cveMetadata"]
+def cve_row(name, raw, batch_id, file_uri, observed_at, processed_at):
+    """Return (row | None, problem | None) for one CVE JSON file. Out of scope -> (None, None)."""
+    m = CVE_FILE.search(name)
+    try:
+        rec = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return None, f"{name}: unreadable ({e})"
+    meta = rec.get("cveMetadata") if isinstance(rec, dict) else None
+    if not isinstance(meta, dict):
+        return None, f"{name}: not a CVE record"
+    if rec.get("dataVersion") not in SUPPORTED_DATA_VERSIONS:
+        return None, f"{name}: unsupported dataVersion {rec.get('dataVersion')}"
+    if meta.get("cveId") != m.group(1):
+        return None, f"{name}: cveId {meta.get('cveId')!r} does not match the file name"
+    try:
         published = parse_ts(meta.get("datePublished"))
-        if published is None or published < COHORT_START_TS:
-            # Out of scope, not a problem. A CVE rejected before it was ever published has no
-            # datePublished and never belongs to the cohort; one published in scope and rejected
-            # later keeps its datePublished and stays, so the rejection is recorded.
-            yield None, None
-            continue
-        yield {
-            "cve_id": meta.get("cveId") or m.group(1), "state": meta.get("state"),
-            "data_version": rec.get("dataVersion"), "date_published": iso(published) if published else None,
-            "date_updated": iso(parse_ts(meta.get("dateUpdated"))) if meta.get("dateUpdated") else None,
-            "record_hash": canonical_hash(rec), "record": rec,
-            "run_id": RUN_ID, "batch_id": batch_id, "file_uri": file_uri, "observed_at": iso(observed_at),
-        }, None
+        updated = parse_ts(meta.get("dateUpdated"))
+    except (TypeError, ValueError) as e:
+        return None, f"{name}: bad date ({e})"
+    if published is None or published < COHORT_START_TS:
+        # Out of scope, not a problem. A CVE rejected before it was ever published has no
+        # datePublished and never belongs to the cohort; one published in scope and rejected
+        # later keeps its datePublished and stays, so the rejection is recorded.
+        return None, None
+    return {
+        "cve_id": meta["cveId"], "state": meta.get("state"), "data_version": rec.get("dataVersion"),
+        "date_published": iso(published), "date_updated": iso(updated) if updated else None,
+        "record_hash": canonical_hash(rec), "record": rec,
+        "run_id": RUN_ID, "batch_id": batch_id, "file_uri": file_uri,
+        "observed_at": iso(observed_at), "processed_at": iso(processed_at),
+    }, None
 
 
-def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, started):
-    observed = now()
+def cve_rows_from_zip(zf, batch_id, file_uri, observed_at, processed_at):
+    """Yield (row | None, problem | None) for every CVE JSON member."""
+    for info_ in zf.infolist():
+        if CVE_FILE.search(info_.filename):
+            yield cve_row(info_.filename, zf.read(info_), batch_id, file_uri, observed_at, processed_at)
+
+
+def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, started, acquired):
+    processed = now()
     rows, problems, seen = [], [], 0
+
+    def take(pairs):
+        nonlocal seen
+        for row, problem in pairs:
+            seen += 1
+            if problem:
+                problems.append(problem)
+            if row:
+                rows.append(row)
+
     with zipfile.ZipFile(zip_path) as outer:
-        names = outer.namelist()
-        inner_zip = next((n for n in names if n.endswith(".zip")), None)
+        inner_zip = next((n for n in outer.namelist() if n.endswith(".zip")), None)
         if inner_zip:  # baseline: ZIP inside a ZIP
             with tempfile.NamedTemporaryFile(suffix=".zip") as tmp:
                 with outer.open(inner_zip) as src:
@@ -361,29 +447,22 @@ def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, sta
                         tmp.write(chunk)
                 tmp.flush()
                 with zipfile.ZipFile(tmp.name) as inner:
-                    for row, problem in cve_rows_from_zip(inner, batch_id, file_uri, observed):
-                        seen += 1
-                        if problem:
-                            problems.append(problem)
-                        if row:
-                            rows.append(row)
+                    take(cve_rows_from_zip(inner, batch_id, file_uri, acquired, processed))
         else:  # hourly delta: CVE files directly
-            for row, problem in cve_rows_from_zip(outer, batch_id, file_uri, observed):
-                seen += 1
-                if problem:
-                    problems.append(problem)
-                if row:
-                    rows.append(row)
+            take(cve_rows_from_zip(outer, batch_id, file_uri, acquired, processed))
+    common = dict(source=source, batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=size,
+                  records_seen=seen, records_failed=len(problems), target=T_CVELIST,
+                  acquired_at=iso(acquired), started_at=iso(started))
     if problems and len(problems) > max(10, seen // 100):
         quarantine(file_uri, f"{len(problems)} bad records, e.g. {problems[:3]}")
-        manifest(source=source, batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=size,
-                 records_seen=seen, records_in_scope=0, records_new=0, status="quarantined",
-                 detail="; ".join(problems[:5]), started_at=iso(started))
+        manifest(**common, records_in_scope=0, records_new=0, status="quarantined",
+                 detail="; ".join(problems[:5]))
         raise RuntimeError("too many bad records; file quarantined")
-    new = insert_new_only(T_CVELIST, rows, ["cve_id", "record_hash"])
-    manifest(source=source, batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=size,
-             records_seen=seen, records_in_scope=len(rows), records_new=new, status="loaded",
-             detail=("; ".join(problems[:5]) if problems else ""), started_at=iso(started))
+    new, _ = insert_new_only(T_CVELIST, rows, ["cve_id", "record_hash"])
+    manifest(**common, records_in_scope=len(rows), records_new=new,
+             status="partial" if problems else "loaded", detail="; ".join(problems[:5]))
+    if problems:
+        error("cvelist records skipped", count=len(problems), examples=problems[:5])
     return new
 
 
@@ -400,18 +479,18 @@ def run_cvelist(kind):
     batch_id = f"{tag}:{asset['name']}"
     with tempfile.NamedTemporaryFile(suffix=".zip") as tmp:
         fetch(asset["browser_download_url"], f"cvelist {kind} {asset['name']}", stream_to=tmp)
-        tmp.flush()
         with open(tmp.name, "rb") as f:
             file_sha = hashlib.file_digest(f, "sha256").hexdigest()
         size = os.path.getsize(tmp.name)
-        file_uri = land("cvelist", f"{tag}__{asset['name']}", path=tmp.name, content_type="application/zip")
-        if already_loaded(file_sha):
+        file_uri, acquired = land("cvelist", f"{tag}__{asset['name']}", path=tmp.name,
+                                  content_type="application/zip")
+        if already_loaded(file_sha, T_CVELIST):
             manifest(source="cvelist", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=size,
-                     records_seen=0, records_in_scope=0, records_new=0, status="unchanged",
-                     detail="same file already processed", started_at=iso(started))
+                     records_seen=0, records_in_scope=0, records_new=0, status="unchanged", target=T_CVELIST,
+                     detail="same file already processed", acquired_at=iso(acquired), started_at=iso(started))
             watermark_set("cvelist", tag, changed=False)
             return 0
-        new = ingest_cvelist_zip(tmp.name, "cvelist", batch_id, file_uri, file_sha, size, started)
+        new = ingest_cvelist_zip(tmp.name, "cvelist", batch_id, file_uri, file_sha, size, started, acquired)
     watermark_set("cvelist", tag, changed=new > 0)
     return new
 
@@ -437,9 +516,10 @@ def run_nvd():
             body = fetch(f"{NVD_API}?{q}", f"nvd page {page}", headers=headers)
             d = json.loads(body)
             batch_id = f"nvd:{iso(chunk_start)}..{iso(chunk_end)}:p{page}"
-            file_uri = land("nvd", f"{chunk_start:%Y%m%dT%H%M%S}_{chunk_end:%Y%m%dT%H%M%S}_p{page:03d}_{sha256(body)[:12]}.json",
-                            data=body, content_type="application/json")
-            observed = now()
+            file_uri, acquired = land(
+                "nvd", f"{chunk_start:%Y%m%dT%H%M%S}_{chunk_end:%Y%m%dT%H%M%S}_p{page:03d}_{sha256(body)[:12]}.json",
+                data=body, content_type="application/json")
+            processed = now()
             rows = []
             for v in d.get("vulnerabilities", []):
                 c = v.get("cve", {})
@@ -449,12 +529,14 @@ def run_nvd():
                 rows.append({"cve_id": c.get("id"), "vuln_status": c.get("vulnStatus"),
                              "published": iso(pub), "last_modified": iso(parse_ts(c.get("lastModified"))),
                              "record_hash": canonical_hash(c), "record": c, "run_id": RUN_ID,
-                             "batch_id": batch_id, "file_uri": file_uri, "observed_at": iso(observed)})
-            new = insert_new_only(T_NVD, rows, ["cve_id", "record_hash"])
+                             "batch_id": batch_id, "file_uri": file_uri, "observed_at": iso(acquired),
+                             "processed_at": iso(processed)})
+            new, _ = insert_new_only(T_NVD, rows, ["cve_id", "record_hash"])
             total_new += new
             manifest(source="nvd", batch_id=batch_id, request=q, file_uri=file_uri, sha256=sha256(body),
                      bytes=len(body), records_seen=len(d.get("vulnerabilities", [])),
-                     records_in_scope=len(rows), records_new=new, status="loaded", started_at=iso(started))
+                     records_in_scope=len(rows), records_new=new, status="loaded", target=T_NVD,
+                     acquired_at=iso(acquired), started_at=iso(started))
             idx += d.get("resultsPerPage", 0)
             page += 1
             time.sleep(pause)
@@ -466,86 +548,134 @@ def run_nvd():
 
 
 # ------------------------------------------------------------------ KEV
+def kev_rows(d, file_sha, acquired, processed):
+    """Rows for kev_records (one per entry) and kev_snapshots (full membership of this catalog)."""
+    version = d.get("catalogVersion")
+    batch_id = f"kev:{version}:{file_sha[:12]}"
+    released = iso(parse_ts(d.get("dateReleased"))) if d.get("dateReleased") else None
+    records, members = [], []
+    for v in d.get("vulnerabilities", []):
+        h = canonical_hash(v)
+        records.append({"cve_id": v.get("cveID"), "catalog_version": version, "date_released": released,
+                        "date_added": v.get("dateAdded"),
+                        "known_ransomware_campaign_use": v.get("knownRansomwareCampaignUse"),
+                        "record_hash": h, "record": v, "run_id": RUN_ID, "batch_id": batch_id,
+                        "observed_at": iso(acquired), "processed_at": iso(processed)})
+        members.append({"catalog_version": version, "cve_id": v.get("cveID"), "record_hash": h,
+                        "batch_id": batch_id, "observed_at": iso(acquired), "processed_at": iso(processed)})
+    return batch_id, records, members
+
+
 def run_kev():
     started = now()
     body = fetch(KEV_URL, "kev catalog")
     file_sha = sha256(body)
     d = json.loads(body)
     version = d.get("catalogVersion")
-    file_uri = land("kev", f"kev_{version}_{file_sha[:12]}.json", data=body, content_type="application/json")
-    if already_loaded(file_sha):
-        manifest(source="kev", batch_id=f"kev:{version}", file_uri=file_uri, sha256=file_sha, bytes=len(body),
-                 records_seen=d.get("count"), records_in_scope=0, records_new=0, status="unchanged",
-                 detail="catalog unchanged", started_at=iso(started))
+    file_uri, acquired = land("kev", f"kev_{version}_{file_sha[:12]}.json", data=body,
+                              content_type="application/json")
+    if already_loaded(file_sha, T_KEV):
+        manifest(source="kev", batch_id=f"kev:{version}:{file_sha[:12]}", file_uri=file_uri, sha256=file_sha,
+                 bytes=len(body), records_seen=d.get("count"), records_in_scope=0, records_new=0,
+                 status="unchanged", target=T_KEV, detail="catalog unchanged", acquired_at=iso(acquired),
+                 started_at=iso(started))
         watermark_set("kev", version, changed=False)
         return 0
-    observed = now()
-    rows = [{"cve_id": v.get("cveID"), "catalog_version": version,
-             "date_released": iso(parse_ts(d.get("dateReleased"))) if d.get("dateReleased") else None,
-             "date_added": v.get("dateAdded"), "known_ransomware_campaign_use": v.get("knownRansomwareCampaignUse"),
-             "record_hash": canonical_hash(v), "record": v, "run_id": RUN_ID, "batch_id": f"kev:{version}",
-             "file_uri": file_uri, "observed_at": iso(observed)} for v in d.get("vulnerabilities", [])]
-    new = insert_new_only(T_KEV, rows, ["cve_id", "record_hash"])
-    manifest(source="kev", batch_id=f"kev:{version}", file_uri=file_uri, sha256=file_sha, bytes=len(body),
-             records_seen=len(rows), records_in_scope=len(rows), records_new=new, status="loaded",
+    batch_id, records, members = kev_rows(d, file_sha, acquired, now())
+    for r in records:
+        r["file_uri"] = file_uri
+    new, _ = insert_new_only(T_KEV, records, ["cve_id", "record_hash"])
+    insert_new_only(T_KEV_SNAP, members, ["batch_id", "cve_id"])
+    manifest(source="kev", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
+             records_seen=len(records), records_in_scope=len(records), records_new=new, status="loaded",
+             target=T_KEV, detail=f"{len(members)} members in catalog {version}", acquired_at=iso(acquired),
              started_at=iso(started))
     watermark_set("kev", version, changed=new > 0)
     return new
 
 
 # ------------------------------------------------------------------ EPSS
-def cohort_ids():
-    q = f"SELECT DISTINCT cve_id FROM `{T_CVELIST}`"
-    return {r.cve_id for r in bq.query(q).result()}
-
-
-def ingest_epss(body, label, started, ids):
-    file_sha = sha256(body)
+def parse_epss(body):
+    """Return (model_version, score_date 'YYYY-MM-DD', csv text without the comment line)."""
     text = gzip.decompress(body).decode("utf-8")
     first, _, rest = text.partition("\n")
     meta = dict(kv.split(":", 1) for kv in first.lstrip("#").split(",") if ":" in kv)
     model, score_ts = meta.get("model_version"), meta.get("score_date")
     if not score_ts or not rest.startswith("cve,epss,percentile"):
         raise RuntimeError(f"unexpected EPSS header: {first[:120]} / {rest[:40]}")
-    score_date = score_ts[:10]
-    file_uri = land("epss", f"epss_{score_date}_{file_sha[:12]}.csv.gz", data=body, content_type="application/gzip")
-    if already_loaded(file_sha):
-        manifest(source="epss", batch_id=f"epss:{score_date}", file_uri=file_uri, sha256=file_sha,
-                 bytes=len(body), records_seen=0, records_in_scope=0, records_new=0, status="unchanged",
-                 detail=label, started_at=iso(started))
+    return model, score_ts[:10], rest
+
+
+def ingest_epss(body, label, started, file_uri=None, acquired=None):
+    """Load one whole EPSS file. With file_uri, the file is re-processed from the raw layer."""
+    file_sha = sha256(body)
+    model, score_date, rest = parse_epss(body)
+    batch_id = f"epss:{score_date}:{file_sha[:12]}"
+    if already_loaded(file_sha, T_EPSS):
+        manifest(source="epss", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
+                 records_seen=0, records_in_scope=0, records_new=0, status="unchanged", target=T_EPSS,
+                 detail=f"{label}; already processed", started_at=iso(started))
         return score_date, 0
-    observed = now()
-    rows, seen = [], 0
-    for r in csv.DictReader(io.StringIO(rest)):
-        seen += 1
-        if r["cve"] in ids:
-            rows.append({"cve_id": r["cve"], "epss": float(r["epss"]), "percentile": float(r["percentile"]),
-                         "score_date": score_date, "model_version": model, "run_id": RUN_ID,
-                         "batch_id": f"epss:{score_date}", "file_uri": file_uri, "observed_at": iso(observed)})
-    new = insert_new_only(T_EPSS, rows, ["cve_id", "score_date"])
-    manifest(source="epss", batch_id=f"epss:{score_date}", file_uri=file_uri, sha256=file_sha, bytes=len(body),
-             records_seen=seen, records_in_scope=len(rows), records_new=new, status="loaded",
-             detail=f"{label}; model {model}", started_at=iso(started))
+    if file_uri is None:
+        file_uri, acquired = land("epss", f"epss_{score_date}_{file_sha[:12]}.csv.gz", data=body,
+                                  content_type="application/gzip")
+    processed = now()
+    rows = [{"cve_id": r["cve"], "epss": float(r["epss"]), "percentile": float(r["percentile"]),
+             "score_date": score_date, "model_version": model, "batch_id": batch_id,
+             "observed_at": iso(acquired), "processed_at": iso(processed)}
+            for r in csv.DictReader(io.StringIO(rest))]
+    new, conflicts = insert_new_only(T_EPSS, rows, ["cve_id", "score_date"], compare_cols=["epss", "percentile"])
+    if conflicts:
+        error("EPSS values differ from stored values for the same day; stored values kept",
+              score_date=score_date, conflicts=conflicts, file_uri=file_uri)
+    manifest(source="epss", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
+             records_seen=len(rows), records_in_scope=len(rows), records_new=new,
+             records_conflicting=conflicts, status="conflicts" if conflicts else "loaded", target=T_EPSS,
+             detail=f"{label}; model {model}", acquired_at=iso(acquired), started_at=iso(started))
     return score_date, new
 
 
 def run_epss():
     started = now()
-    score_date, new = ingest_epss(fetch(EPSS_CURRENT, "epss current"), "current", started, cohort_ids())
+    score_date, new = ingest_epss(fetch(EPSS_CURRENT, "epss current"), "current", started)
     watermark_set("epss", score_date, changed=new > 0)
     return new
 
 
-def run_epss_backfill():
-    started, ids, total = now(), cohort_ids(), 0
-    for d in range(EPSS_BACKFILL_DAYS, 0, -1):
-        day = (now() - dt.timedelta(days=d)).strftime("%Y-%m-%d")
+def run_epss_reprocess():
+    """Rebuild the EPSS table from files already stored in the raw layer (replay, no download).
+    observed_at keeps the time the file was first stored; processed_at is now."""
+    started, total, failed = now(), 0, []
+    for blob in gcs.list_blobs(prefix="raw/epss/"):
         try:
-            _, new = ingest_epss(fetch(EPSS_DATED.format(day=day), f"epss {day}"), f"backfill {day}", started, ids)
+            _, new = ingest_epss(blob.download_as_bytes(), f"reprocess {blob.name}", started,
+                                 file_uri=f"gs://{BUCKET}/{blob.name}", acquired=blob.time_created)
             total += new
-        except Exception as e:  # noqa: BLE001 - one missing day must not stop the backfill
-            manifest(source="epss", batch_id=f"epss:{day}", status="failed", detail=str(e)[:300],
-                     started_at=iso(started))
+        except Exception as e:  # noqa: BLE001 - try every file, fail at the end
+            failed.append(blob.name)
+            manifest(source="epss", file_uri=f"gs://{BUCKET}/{blob.name}", status="failed", target=T_EPSS,
+                     detail=str(e)[:300], started_at=iso(started))
+    if failed:
+        raise RuntimeError(f"EPSS re-process incomplete: {len(failed)} files failed, e.g. {failed[:3]}")
+    return total
+
+
+def run_epss_backfill():
+    """Dated EPSS files from COHORT_START to yesterday. Files already processed are skipped."""
+    started, total, failed = now(), 0, []
+    day, today = COHORT_START_TS.date(), now().date()
+    while day < today:
+        try:
+            _, new = ingest_epss(fetch(EPSS_DATED.format(day=day.isoformat()), f"epss {day}"),
+                                 f"backfill {day}", started)
+            total += new
+        except Exception as e:  # noqa: BLE001 - try every day, fail at the end
+            failed.append(day.isoformat())
+            manifest(source="epss", batch_id=f"epss:{day}", status="failed", target=T_EPSS,
+                     detail=str(e)[:300], started_at=iso(started))
+        day += dt.timedelta(days=1)
+    if failed:
+        raise RuntimeError(f"EPSS backfill incomplete: missing days {failed}")
     return total
 
 
@@ -605,26 +735,49 @@ RUNNERS = {
     "nvd": run_nvd,
     "kev": run_kev,
     "epss": run_epss,
+    "epss_reprocess": run_epss_reprocess,
     "epss_backfill": run_epss_backfill,
 }
+# Modes that write the same tables share one lock.
+LOCK_FOR = {"hourly": "cvelist", "cvelist_baseline": "cvelist",
+            "epss_reprocess": "epss", "epss_backfill": "epss"}
+
+
+def record_run(status, started, err=None):
+    """ops.ingest_runs: one row when a run starts and one when it ends, even if nothing was downloaded."""
+    try:
+        load_json_rows(RUNS, [{"run_id": RUN_ID, "mode": MODE, "status": status, "git_sha": GIT_SHA,
+                               "processor": PROCESSOR_VERSION, "error": (err or "")[:1000] or None,
+                               "started_at": iso(started),
+                               "finished_at": None if status == "started" else iso(now()),
+                               "recorded_at": iso(now())}])
+    except Exception as e:  # noqa: BLE001 - bookkeeping must never hide the real result
+        error("could not write ops.ingest_runs", error=str(e)[:300])
 
 
 def main():
     if MODE not in RUNNERS:
         error("unknown mode", known=list(RUNNERS))
         return 2
+    started = now()
     try:
         ensure_tables()
-        lock_name = "cvelist" if MODE in ("hourly", "cvelist_baseline") else MODE
+    except Exception as e:  # noqa: BLE001
+        error("run failed", error=f"ensure_tables: {e}"[:1000])
+        return 1
+    record_run("started", started)
+    try:
         if MODE == "daily":
             new = RUNNERS[MODE]()  # takes one lock per source inside
         else:
-            with Lock(lock_name):
+            with Lock(LOCK_FOR.get(MODE, MODE)):
                 new = RUNNERS[MODE]()
         info("run finished", new_rows=new)
+        record_run("succeeded", started)
         return 0
     except Exception as e:  # noqa: BLE001
         error("run failed", error=str(e)[:1000])
+        record_run("failed", started, str(e))
         return 1
 
 

@@ -1,0 +1,113 @@
+"""Integration tests against real BigQuery and Cloud Storage, in throwaway resources.
+Do not run directly: tests/run_integration.sh creates test_bronze / test_ops and a test bucket,
+sets BRONZE_DATASET, OPS_DATASET and BUCKET, runs this file, then deletes everything.
+"""
+import datetime as dt
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "extractor"))
+assert os.environ.get("BRONZE_DATASET", "").startswith("test_"), "refusing to run outside test datasets"
+assert os.environ.get("OPS_DATASET", "").startswith("test_"), "refusing to run outside test datasets"
+sys.argv = ["main.py", "epss"]
+import main  # noqa: E402
+from google.cloud import bigquery  # noqa: E402
+
+bq = main.bq
+RESULTS = []
+
+
+def check(name, cond, detail=""):
+    RESULTS.append(cond)
+    print(f"{'PASS' if cond else 'FAIL'}  {name}{('  -- ' + str(detail)) if detail else ''}", flush=True)
+
+
+def one(sql, **params):
+    qp = [bigquery.ScalarQueryParameter(k, "TIMESTAMP" if isinstance(v, dt.datetime) else "STRING", v)
+          for k, v in params.items()]
+    return list(bq.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp)).result())
+
+
+# ------------------------------------------------------------ 0. schema evolution on an old table
+old_kev = bigquery.Table(main.T_KEV, schema=[f for f in main.TABLES[main.T_KEV][0] if f.name != "processed_at"])
+old_kev.time_partitioning = bigquery.TimePartitioning(field="observed_at")
+bq.create_table(old_kev)
+main.ensure_tables()
+cols = {f.name for f in bq.get_table(main.T_KEV).schema}
+check("0. ensure_tables adds processed_at to a table created with the old schema", "processed_at" in cols)
+
+# ------------------------------------------------------------ 3. EPSS: re-process, no duplicates, conflicts
+E = main.T_EPSS
+main.run_epss_reprocess()
+n1, d1 = one(f"SELECT COUNT(*) n, COUNT(DISTINCT CONCAT(cve_id, CAST(score_date AS STRING))) d FROM `{E}`")[0]
+files = one(f"SELECT COUNT(*) n FROM `{main.MANIFEST}` WHERE source='epss' AND status='loaded'")[0].n
+check("3a. re-process from raw loads every stored file", files == 2, f"{files} files, {n1:,} rows")
+check("3a. one row per (cve_id, score_date)", n1 == d1 and n1 > 0, f"rows {n1:,}, distinct {d1:,}")
+
+days = one(f"SELECT score_date, COUNT(*) n, MIN(observed_at) obs, MIN(processed_at) proc FROM `{E}` GROUP BY 1 ORDER BY 1")
+for r in days:
+    check(f"3a. {r.score_date}: observed_at is the raw file time, earlier than processed_at",
+          r.obs < r.proc, f"{r.n:,} rows, observed {r.obs:%Y-%m-%d %H:%M}, processed {r.proc:%Y-%m-%d %H:%M}")
+
+main.run_epss_reprocess()
+n2 = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
+unchanged = one(f"SELECT COUNT(*) n FROM `{main.MANIFEST}` WHERE source='epss' AND status='unchanged'")[0].n
+check("3b. running the same files again adds no rows", n2 == n1, f"{n1:,} -> {n2:,}")
+check("3b. ...and records them as unchanged", unchanged == 2, unchanged)
+
+blob = next(iter(main.gcs.list_blobs(prefix="raw/epss/")))
+model, score_date, rest = main.parse_epss(blob.download_as_bytes())
+import csv, io  # noqa: E401,E402
+rows = [{"cve_id": r["cve"], "epss": float(r["epss"]), "percentile": float(r["percentile"]),
+         "score_date": score_date, "model_version": model, "batch_id": "test-same",
+         "observed_at": main.iso(main.now()), "processed_at": main.iso(main.now())}
+        for r in csv.DictReader(io.StringIO(rest))]
+new, conflicts = main.insert_new_only(E, rows, ["cve_id", "score_date"], compare_cols=["epss", "percentile"])
+check("3c. same values loaded again (new processor version): 0 new, 0 conflicts",
+      new == 0 and conflicts == 0, f"new {new}, conflicts {conflicts}")
+
+changed = [dict(r, epss=round(r["epss"] + 0.1, 5), batch_id="test-changed") for r in rows[:5]]
+new, conflicts = main.insert_new_only(E, changed, ["cve_id", "score_date"], compare_cols=["epss", "percentile"])
+n3 = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
+check("3d. different value for the same cve_id + score_date is reported, not inserted",
+      new == 0 and conflicts == 5 and n3 == n1, f"new {new}, conflicts {conflicts}, rows {n3:,}")
+
+dup = rows[:3] + rows[:3]
+new, _ = main.insert_new_only(E, [dict(r, score_date="2000-01-01") for r in dup], ["cve_id", "score_date"])
+check("3e. duplicates inside one batch are inserted once", new == 3, f"new {new}")
+
+size = bq.get_table(E)
+check("3f. size per EPSS day (measured)", True,
+      f"{size.num_rows:,} rows, {size.num_bytes / 1e6:.1f} MB logical in total "
+      f"= {size.num_bytes / max(1, len(days)) / 1e6:.1f} MB per day")
+
+# ------------------------------------------------------------ 4. KEV membership per catalog version
+t1 = dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc)
+t2 = dt.datetime(2026, 11, 2, 12, tzinfo=dt.timezone.utc)
+
+
+def entry(cve):
+    return {"cveID": cve, "dateAdded": "2026-10-30", "knownRansomwareCampaignUse": "Unknown"}
+
+
+v1 = {"catalogVersion": "test.1", "vulnerabilities": [entry("CVE-T-A"), entry("CVE-T-B"), entry("CVE-T-C")]}
+v2 = {"catalogVersion": "test.2", "vulnerabilities": [entry("CVE-T-A"), entry("CVE-T-C")]}  # B removed
+for d, sha, t in ((v1, "a" * 64, t1), (v2, "b" * 64, t2)):
+    _, _, members = main.kev_rows(d, sha, t, main.now())
+    main.insert_new_only(main.T_KEV_SNAP, members, ["batch_id", "cve_id"])
+
+AS_OF = (f"SELECT ARRAY_AGG(cve_id ORDER BY cve_id) m FROM `{main.T_KEV_SNAP}` WHERE batch_id = ("
+         f"SELECT batch_id FROM `{main.T_KEV_SNAP}` WHERE observed_at <= @c "
+         f"ORDER BY observed_at DESC, batch_id DESC LIMIT 1)")
+before = one(AS_OF, c=t1 + dt.timedelta(hours=1))[0].m
+after = one(AS_OF, c=t2 + dt.timedelta(hours=1))[0].m
+kept = one(f"SELECT COUNT(*) n FROM `{main.T_KEV_SNAP}` WHERE cve_id='CVE-T-B'")[0].n
+check("4a. membership as of the first catalog: A, B, C", before == ["CVE-T-A", "CVE-T-B", "CVE-T-C"], before)
+check("4b. membership as of the second catalog: B is gone", after == ["CVE-T-A", "CVE-T-C"], after)
+check("4c. B's earlier membership is still stored", kept == 1, kept)
+_, _, members = main.kev_rows(v2, "b" * 64, t2, main.now())
+new, _ = main.insert_new_only(main.T_KEV_SNAP, members, ["batch_id", "cve_id"])
+check("4d. loading the same catalog again adds nothing", new == 0, new)
+
+print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
+sys.exit(0 if all(RESULTS) else 1)
