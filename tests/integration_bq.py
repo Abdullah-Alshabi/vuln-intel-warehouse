@@ -62,15 +62,33 @@ rows = [{"cve_id": r["cve"], "epss": float(r["epss"]), "percentile": float(r["pe
          "score_date": score_date, "model_version": model, "batch_id": "test-same",
          "observed_at": main.iso(main.now()), "processed_at": main.iso(main.now())}
         for r in csv.DictReader(io.StringIO(rest))]
-new, conflicts = main.insert_new_only(E, rows, ["cve_id", "score_date"], compare_cols=["epss", "percentile"])
-check("3c. same values loaded again (new processor version): 0 new, 0 conflicts",
-      new == 0 and conflicts == 0, f"new {new}, conflicts {conflicts}")
+CMP = ["epss", "percentile", "model_version"]
+main.PROCESSOR_VERSION = "2-test-bump"          # a new parser version must re-process stored files
+main.run_epss_reprocess()
+bumped = one(f"SELECT COUNT(*) n, SUM(records_new) new, SUM(records_conflicting) c FROM `{main.MANIFEST}` "
+             f"WHERE source='epss' AND processor='2-test-bump' AND status='loaded'")[0]
+n_bump = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
+check("3c. new PROCESSOR_VERSION: the manifest no longer skips the files, they are re-processed",
+      bumped.n == 2, f"{bumped.n} files re-processed")
+check("3c. ...with the same values: 0 new rows, 0 conflicts",
+      bumped.new == 0 and bumped.c == 0 and n_bump == n1, f"new {bumped.new}, conflicts {bumped.c}, rows {n_bump:,}")
 
 changed = [dict(r, epss=round(r["epss"] + 0.1, 5), batch_id="test-changed") for r in rows[:5]]
-new, conflicts = main.insert_new_only(E, changed, ["cve_id", "score_date"], compare_cols=["epss", "percentile"])
+new, conflicts = main.insert_new_only(E, changed, ["cve_id", "score_date"], compare_cols=CMP)
 n3 = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
 check("3d. different value for the same cve_id + score_date is reported, not inserted",
       new == 0 and conflicts == 5 and n3 == n1, f"new {new}, conflicts {conflicts}, rows {n3:,}")
+
+model_only = [dict(r, model_version="v-other") for r in rows[5:9]]
+new, conflicts = main.insert_new_only(E, model_only, ["cve_id", "score_date"], compare_cols=CMP)
+check("3d. a different model_version alone is also a conflict", new == 0 and conflicts == 4,
+      f"new {new}, conflicts {conflicts}")
+
+fresh = [dict(r, score_date="2001-01-01") for r in rows[:2]]
+clash = fresh + [dict(fresh[0], epss=0.999)]     # same key twice in one batch, different values
+new, conflicts = main.insert_new_only(E, clash, ["cve_id", "score_date"], compare_cols=CMP)
+check("3d. one key with two different values inside a first batch is reported",
+      conflicts == 1, f"new {new}, conflicts {conflicts}")
 
 dup = rows[:3] + rows[:3]
 new, _ = main.insert_new_only(E, [dict(r, score_date="2000-01-01") for r in dup], ["cve_id", "score_date"])

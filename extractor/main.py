@@ -121,8 +121,10 @@ def canonical_hash(obj):
 
 
 def parse_ts(s):
-    if not s:
+    if s is None or s == "":
         return None
+    if not isinstance(s, str):
+        raise ValueError(f"timestamp is {type(s).__name__}, not text: {s!r}")
     t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
@@ -251,7 +253,11 @@ def insert_sql(table_id, stage, key_cols, compare_cols=()):
     conflict = None
     if compare_cols:
         diff = " OR ".join(f"t.{c} IS DISTINCT FROM s.{c}" for c in compare_cols)
-        conflict = f"SELECT COUNT(*) AS n FROM ({dedup}) s JOIN `{table_id}` t ON {on} WHERE {diff}"
+        values = f"TO_JSON_STRING(STRUCT({', '.join(compare_cols)}))"
+        # 1) key already stored with other values; 2) one key with different values inside this batch
+        conflict = (f"SELECT (SELECT COUNT(*) FROM ({dedup}) s JOIN `{table_id}` t ON {on} WHERE {diff}) + "
+                    f"(SELECT COUNT(*) FROM (SELECT {keys} FROM `{stage}` GROUP BY {keys} "
+                    f"HAVING COUNT(DISTINCT {values}) > 1)) AS n")
     insert = (f"INSERT INTO `{table_id}` ({', '.join(cols)}) "
               f"SELECT {', '.join('s.' + c for c in cols)} FROM ({dedup}) s "
               f"WHERE NOT EXISTS (SELECT 1 FROM `{table_id}` t WHERE {on})")
@@ -331,12 +337,10 @@ def land(source, name, data=None, path=None, content_type="application/octet-str
             blob.upload_from_filename(path, content_type=content_type, if_generation_match=0)
         else:
             blob.upload_from_string(data, content_type=content_type, if_generation_match=0)
-        acquired = now()
     except PreconditionFailed:
-        blob.reload()
-        acquired = blob.time_created
         info("raw object already stored", uri=f"gs://{BUCKET}/{blob.name}")
-    return f"gs://{BUCKET}/{blob.name}", acquired
+    blob.reload()  # one clock for every path: the object's own creation time in Cloud Storage
+    return f"gs://{BUCKET}/{blob.name}", blob.time_created
 
 
 def quarantine(file_uri, reason):
@@ -606,10 +610,15 @@ def parse_epss(body):
     return model, score_ts[:10], rest
 
 
-def ingest_epss(body, label, started, file_uri=None, acquired=None):
-    """Load one whole EPSS file. With file_uri, the file is re-processed from the raw layer."""
+def ingest_epss(body, label, started, file_uri=None, acquired=None, expected_date=None):
+    """Load one whole EPSS file. With file_uri, the file is re-processed from the raw layer.
+    With expected_date, a file whose score_date is another day is refused (nothing is loaded).
+    Value conflicts are loaded nowhere, recorded in the manifest, and fail the run, so a report
+    is never published on top of them."""
     file_sha = sha256(body)
     model, score_date, rest = parse_epss(body)
+    if expected_date and score_date != expected_date:
+        raise RuntimeError(f"EPSS file for {expected_date} has score_date {score_date}")
     batch_id = f"epss:{score_date}:{file_sha[:12]}"
     if already_loaded(file_sha, T_EPSS):
         manifest(source="epss", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
@@ -624,7 +633,8 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None):
              "score_date": score_date, "model_version": model, "batch_id": batch_id,
              "observed_at": iso(acquired), "processed_at": iso(processed)}
             for r in csv.DictReader(io.StringIO(rest))]
-    new, conflicts = insert_new_only(T_EPSS, rows, ["cve_id", "score_date"], compare_cols=["epss", "percentile"])
+    new, conflicts = insert_new_only(T_EPSS, rows, ["cve_id", "score_date"],
+                                     compare_cols=["epss", "percentile", "model_version"])
     if conflicts:
         error("EPSS values differ from stored values for the same day; stored values kept",
               score_date=score_date, conflicts=conflicts, file_uri=file_uri)
@@ -632,6 +642,8 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None):
              records_seen=len(rows), records_in_scope=len(rows), records_new=new,
              records_conflicting=conflicts, status="conflicts" if conflicts else "loaded", target=T_EPSS,
              detail=f"{label}; model {model}", acquired_at=iso(acquired), started_at=iso(started))
+    if conflicts:
+        raise RuntimeError(f"EPSS {score_date}: {conflicts} values differ from stored ones; not published")
     return score_date, new
 
 
@@ -667,7 +679,7 @@ def run_epss_backfill():
     while day < today:
         try:
             _, new = ingest_epss(fetch(EPSS_DATED.format(day=day.isoformat()), f"epss {day}"),
-                                 f"backfill {day}", started)
+                                 f"backfill {day}", started, expected_date=day.isoformat())
             total += new
         except Exception as e:  # noqa: BLE001 - try every day, fail at the end
             failed.append(day.isoformat())

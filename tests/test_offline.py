@@ -45,10 +45,13 @@ def check(name, cond, detail=""):
 class FakeBlob:
     store = {}  # name -> (generation, bytes, updated)
 
+    created = {}  # name -> first creation time
+
     def __init__(self, name):
         self.name = name
         self.generation = None
         self.updated = None
+        self.time_created = None
 
     def upload_from_string(self, data, if_generation_match=None, **_):
         cur = self.store.get(self.name)
@@ -57,10 +60,11 @@ class FakeBlob:
             raise PreconditionFailed(self.name)
         data = data.encode() if isinstance(data, str) else data
         self.store[self.name] = (cur_gen + 1, data, main.now())
+        self.created.setdefault(self.name, main.now())
 
     def reload(self):
         gen, _, upd = self.store[self.name]
-        self.generation, self.updated = gen, upd
+        self.generation, self.updated, self.time_created = gen, upd, self.created[self.name]
 
     def download_as_bytes(self, if_generation_match=None):
         gen, data, _ = self.store[self.name]
@@ -177,13 +181,15 @@ cases = {
     "cveId does not match file name": (rec("CVE-2026-9999"), "problem"),
     "cveMetadata is not an object": (json.dumps({"dataVersion": "5.1", "cveMetadata": "x"}).encode(), "problem"),
     "bad date": (rec("CVE-2026-1005", "not-a-date"), "problem"),
+    "date is a number": (rec("CVE-2026-1007", 1730000000), "problem"),
     "unsupported dataVersion": (json.dumps({"dataVersion": "4.0", "cveMetadata": {"cveId": "CVE-2026-1006"}}).encode(),
                                 "problem"),
 }
 names = {"in scope": "CVE-2026-1000", "published before cohort": "CVE-2026-1001",
          "rejected before publish (no datePublished)": "CVE-2026-1002",
          "cveId does not match file name": "CVE-2026-1003", "cveMetadata is not an object": "CVE-2026-1004",
-         "bad date": "CVE-2026-1005", "unsupported dataVersion": "CVE-2026-1006"}
+         "bad date": "CVE-2026-1005", "unsupported dataVersion": "CVE-2026-1006",
+         "date is a number": "CVE-2026-1007"}
 for label, (raw, expect) in cases.items():
     row, problem = main.cve_row(f"cves/2026/1xxx/{names[label]}.json", raw, "b", "gs://x", T, T)
     got = "row" if row else ("problem" if problem else "skip")
@@ -198,6 +204,67 @@ check("SQL: insert de-duplicates inside the batch and skips stored keys",
       "QUALIFY ROW_NUMBER() OVER (PARTITION BY cve_id, score_date" in insert_q and "WHERE NOT EXISTS" in insert_q)
 check("SQL: conflicts compare values with IS DISTINCT FROM",
       conflict_q is not None and "t.epss IS DISTINCT FROM s.epss" in conflict_q)
+check("SQL: conflicts also count one key with different values inside the batch",
+      "HAVING COUNT(DISTINCT TO_JSON_STRING(STRUCT(epss, percentile))) > 1" in conflict_q)
+
+# ---------------------------------------------------------------- land(): one stable clock
+import gzip  # noqa: E402
+
+FakeBlob.store.clear()
+FakeBlob.created.clear()
+times = iter([dt.datetime(2026, 11, 9, 1, tzinfo=dt.timezone.utc), dt.datetime(2026, 11, 9, 5, tzinfo=dt.timezone.utc)])
+with mock.patch.object(main, "now", lambda: next(times, dt.datetime(2026, 11, 9, 9, tzinfo=dt.timezone.utc))):
+    _, first = main.land("kev", "same.json", data=b"x")
+    _, again = main.land("kev", "same.json", data=b"x")
+check("land: observed time is the object's creation time, the same on every later landing",
+      first == again and first is not None, f"{first} / {again}")
+
+# ---------------------------------------------------------------- EPSS: wrong day is refused
+body = gzip.compress(b"#model_version:v2026.06.15,score_date:2026-11-02T12:55:00Z\n"
+                     b"cve,epss,percentile\nCVE-2026-0001,0.1,0.5\n")
+landed = []
+with mock.patch.object(main, "already_loaded", lambda *a: False), \
+     mock.patch.object(main, "land", lambda *a, **k: landed.append(a) or ("gs://x", main.now())):
+    try:
+        main.ingest_epss(body, "backfill", main.now(), expected_date="2026-11-03")
+        refused = None
+    except RuntimeError as e:
+        refused = str(e)
+check("epss_backfill: a file whose score_date is another day is refused before anything is stored",
+      refused is not None and "2026-11-02" in refused and not landed, str(refused))
+
+# ---------------------------------------------------------------- EPSS: conflicts fail the run
+manifests.clear()
+with mock.patch.object(main, "already_loaded", lambda *a: False), \
+     mock.patch.object(main, "land", lambda *a, **k: ("gs://x", main.now())), \
+     mock.patch.object(main, "insert_new_only", lambda *a, **k: (0, 7)), \
+     mock.patch.object(main, "manifest", lambda **r: manifests.append(r)):
+    try:
+        main.ingest_epss(body, "current", main.now())
+        failed = None
+    except RuntimeError as e:
+        failed = str(e)
+check("EPSS conflicts: recorded in the manifest, then the run fails (no report on top of them)",
+      failed is not None and manifests and manifests[-1]["status"] == "conflicts"
+      and manifests[-1]["records_conflicting"] == 7, str(failed))
+
+# ---------------------------------------------------------------- run_kev(): load, then hash skip
+catalog = json.dumps({"catalogVersion": "2026.11.06", "count": 2, "dateReleased": "2026-11-06T12:00:00Z",
+                      "vulnerabilities": [{"cveID": "CVE-1"}, {"cveID": "CVE-2"}]}).encode()
+seen_sha, manifests, inserted = set(), [], []
+with mock.patch.object(main, "fetch", lambda *a, **k: catalog), \
+     mock.patch.object(main, "land", lambda *a, **k: ("gs://raw/kev", T)), \
+     mock.patch.object(main, "already_loaded", lambda sha, target: sha in seen_sha), \
+     mock.patch.object(main, "insert_new_only", lambda t, rows, *a, **k: inserted.append((t, len(rows))) or (len(rows), 0)), \
+     mock.patch.object(main, "manifest", lambda **r: (manifests.append(r), seen_sha.add(r["sha256"]))), \
+     mock.patch.object(main, "watermark_set", lambda *a, **k: None):
+    main.run_kev()
+    main.run_kev()
+check("run_kev: first run loads records and the full membership",
+      inserted == [(main.T_KEV, 2), (main.T_KEV_SNAP, 2)] and manifests[0]["status"] == "loaded", str(inserted))
+check("run_kev: same catalog again is skipped, and the observation is still recorded with the same batch_id",
+      len(inserted) == 2 and manifests[1]["status"] == "unchanged"
+      and manifests[1]["batch_id"] == manifests[0]["batch_id"], f"{manifests[1].get('batch_id')}")
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)
