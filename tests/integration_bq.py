@@ -65,13 +65,13 @@ rows = [{"cve_id": r["cve"], "epss": float(r["epss"]), "percentile": float(r["pe
 CMP = ["epss", "percentile", "model_version"]
 main.PROCESSOR_VERSION = "2-test-bump"          # a new parser version must re-process stored files
 main.run_epss_reprocess()
-bumped = one(f"SELECT COUNT(*) n, SUM(records_new) new, SUM(records_conflicting) c FROM `{main.MANIFEST}` "
+bumped = one(f"SELECT COUNT(*) n, SUM(records_new) new_rows, SUM(records_conflicting) c FROM `{main.MANIFEST}` "
              f"WHERE source='epss' AND processor='2-test-bump' AND status='loaded'")[0]
 n_bump = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
 check("3c. new PROCESSOR_VERSION: the manifest no longer skips the files, they are re-processed",
       bumped.n == 2, f"{bumped.n} files re-processed")
 check("3c. ...with the same values: 0 new rows, 0 conflicts",
-      bumped.new == 0 and bumped.c == 0 and n_bump == n1, f"new {bumped.new}, conflicts {bumped.c}, rows {n_bump:,}")
+      bumped.new_rows == 0 and bumped.c == 0 and n_bump == n1, f"new {bumped.new_rows}, conflicts {bumped.c}, rows {n_bump:,}")
 
 changed = [dict(r, epss=round(r["epss"] + 0.1, 5), batch_id="test-changed") for r in rows[:5]]
 new, conflicts = main.insert_new_only(E, changed, ["cve_id", "score_date"], compare_cols=CMP)
