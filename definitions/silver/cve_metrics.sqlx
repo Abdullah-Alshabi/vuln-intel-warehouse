@@ -1,0 +1,102 @@
+config {
+  type: "table",
+  schema: "silver",
+  description: "Every CVSS score found for a CVE, one row per score, for every stored version of the source record. Keeps who wrote the score (metric_provider) apart from where we read it (ingestion_source). Selection rules are applied later, in gold.",
+  bigquery: { clusterBy: ["cve_id"] },
+  columns: {
+    cve_id: "CVE identifier",
+    record_hash: "Hash of the source record version this score came from (joins back to bronze)",
+    ingestion_source: "Where we read the score: cvelist (CVE.org) or nvd (NVD API)",
+    provider_role: "CNA or ADP (cvelist); NVD or non-NVD (nvd, by the metric's source field)",
+    metric_provider: "Who wrote the score: CNA/ADP short name in cvelist, the 'source' field in NVD",
+    provider_org_id: "CVE.org organisation UUID of the provider (cvelist only)",
+    nvd_type: "NVD's Primary/Secondary label (NVD only). Primary does not mean NVD wrote it",
+    cvss_version: "4.0, 3.1, 3.0 or 2.0, from the field the score was found in",
+    declared_version: "Version written inside the score object itself",
+    base_score: "CVSS base score, 0 to 10",
+    base_severity: "Severity text given with the score",
+    vector: "CVSS vector string",
+    source_updated_at: "Source time of the record version: dateUpdated (cvelist) or lastModified (NVD)",
+    observed_at: "When we first had the file this version came from"
+  },
+  assertions: {
+    nonNull: ["cve_id", "record_hash", "ingestion_source", "cvss_version", "observed_at"],
+    rowConditions: [
+      "base_score BETWEEN 0 AND 10",
+      "cvss_version IN ('4.0', '3.1', '3.0', '2.0')",
+      "declared_version IS NULL OR STARTS_WITH(declared_version, LEFT(cvss_version, 1))"
+    ]
+  }
+}
+
+WITH cvelist AS (
+  SELECT cve_id, record_hash, record, date_updated AS source_updated_at, observed_at
+  FROM ${ref("cvelist_records")}
+),
+
+-- CVE.org: the CNA container has one metrics list; each ADP container has its own.
+cve_metric_objects AS (
+  SELECT c.cve_id, c.record_hash, c.source_updated_at, c.observed_at,
+    'CNA' AS provider_role,
+    JSON_VALUE(c.record, '$.containers.cna.providerMetadata.shortName') AS metric_provider,
+    JSON_VALUE(c.record, '$.containers.cna.providerMetadata.orgId') AS provider_org_id,
+    m AS metric
+  FROM cvelist c, UNNEST(JSON_QUERY_ARRAY(c.record, '$.containers.cna.metrics')) AS m
+  UNION ALL
+  SELECT c.cve_id, c.record_hash, c.source_updated_at, c.observed_at,
+    'ADP',
+    JSON_VALUE(a, '$.providerMetadata.shortName'),
+    JSON_VALUE(a, '$.providerMetadata.orgId'),
+    m
+  FROM cvelist c,
+    UNNEST(JSON_QUERY_ARRAY(c.record, '$.containers.adp')) AS a,
+    UNNEST(JSON_QUERY_ARRAY(a, '$.metrics')) AS m
+),
+
+-- Each metrics item holds at most one CVSS object, under a key that names its version.
+cve_side AS (
+  SELECT o.cve_id, o.record_hash, 'cvelist' AS ingestion_source, o.provider_role, o.metric_provider,
+    o.provider_org_id, CAST(NULL AS STRING) AS nvd_type, k.ver AS cvss_version, k.obj AS cvss,
+    CAST(NULL AS STRING) AS outer_severity, o.source_updated_at, o.observed_at
+  FROM cve_metric_objects o,
+    UNNEST([STRUCT('4.0' AS ver, JSON_QUERY(o.metric, '$.cvssV4_0') AS obj),
+            STRUCT('3.1', JSON_QUERY(o.metric, '$.cvssV3_1')),
+            STRUCT('3.0', JSON_QUERY(o.metric, '$.cvssV3_0')),
+            STRUCT('2.0', JSON_QUERY(o.metric, '$.cvssV2_0'))]) AS k
+  WHERE k.obj IS NOT NULL
+),
+
+-- NVD: one array per version; each item says who wrote it (source) and NVD's label (type).
+nvd_side AS (
+  SELECT n.cve_id, n.record_hash, 'nvd' AS ingestion_source,
+    IF(JSON_VALUE(m, '$.source') = 'nvd@nist.gov', 'NVD', 'non-NVD') AS provider_role,
+    JSON_VALUE(m, '$.source') AS metric_provider,
+    CAST(NULL AS STRING) AS provider_org_id,
+    JSON_VALUE(m, '$.type') AS nvd_type,
+    k.ver AS cvss_version,
+    JSON_QUERY(m, '$.cvssData') AS cvss,
+    JSON_VALUE(m, '$.baseSeverity') AS outer_severity,  -- CVSS 2.0 keeps severity outside cvssData
+    n.last_modified AS source_updated_at, n.observed_at
+  FROM ${ref("nvd_records")} n,
+    UNNEST([STRUCT('4.0' AS ver, JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV40') AS arr),
+            STRUCT('3.1', JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV31')),
+            STRUCT('3.0', JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV30')),
+            STRUCT('2.0', JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV2'))]) AS k,
+    UNNEST(k.arr) AS m
+),
+
+all_scores AS (
+  SELECT * FROM cve_side
+  UNION ALL
+  SELECT * FROM nvd_side
+)
+
+SELECT
+  cve_id, record_hash, ingestion_source, provider_role, metric_provider, provider_org_id, nvd_type,
+  cvss_version,
+  JSON_VALUE(cvss, '$.version') AS declared_version,
+  SAFE_CAST(JSON_VALUE(cvss, '$.baseScore') AS FLOAT64) AS base_score,
+  COALESCE(JSON_VALUE(cvss, '$.baseSeverity'), outer_severity) AS base_severity,
+  JSON_VALUE(cvss, '$.vectorString') AS vector,
+  source_updated_at, observed_at
+FROM all_scores

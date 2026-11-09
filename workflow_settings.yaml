@@ -1,0 +1,7 @@
+# Dataform project settings (Dataform reads this file from the repository root).
+# extractor/ and infra/ are ignored by Dataform; it only compiles definitions/ and includes/.
+defaultProject: vuln-intel-warehouse
+defaultLocation: us-central1
+defaultDataset: silver
+defaultAssertionDataset: ops
+dataformCoreVersion: 3.0.0
