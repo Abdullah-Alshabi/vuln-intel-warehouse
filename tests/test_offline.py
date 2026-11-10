@@ -302,8 +302,23 @@ def fake_query(q, job_config=None):
     return types.SimpleNamespace(result=lambda: [types.SimpleNamespace(day="2026-11-09")])
 with mock.patch.object(main, "bq", types.SimpleNamespace(query=fake_query)):
     gaps = main.epss_gap_days("2026-11-11")
-check("epss_gap_days: expected days come from GENERATE_DATE_ARRAY, not MAX(score_date)",
-      gaps == ["2026-11-09"] and "GENERATE_DATE_ARRAY" in captured["q"] and "MAX(score_date)" not in captured["q"])
+check("epss_gap_days: expected days come from GENERATE_DATE_ARRAY joined to the shared status view",
+      gaps == ["2026-11-09"] and "GENERATE_DATE_ARRAY" in captured["q"] and main.V_EPSS_DAYS in captured["q"])
+check("epss_day_status: complete needs a load, no conflict, and table rows = manifest rows (> 0)",
+      all(x in main.epss_day_status_sql() for x in ("ok_loads", "conflict_rows", "table_rows = loaded_rows")))
+
+# run_epss: after the gap fill, the final check covers the current day too
+with mock.patch.object(main, "fetch", lambda url, what, **k: url.encode()), \
+     mock.patch.object(main, "epss_gap_days", lambda d: ["2026-11-10"] if d == "2026-11-11" else []), \
+     mock.patch.object(main, "ingest_epss", lambda body, label, *a, **k: ("2026-11-10", 0)), \
+     mock.patch.object(main, "watermark_set", lambda *a, **k: None):
+    try:
+        main.run_epss()
+        final_err = None
+    except RuntimeError as e:
+        final_err = str(e)
+check("run_epss: the current day itself still incomplete ('unchanged' but rows differ) -> the run fails",
+      final_err is not None and "2026-11-10" in final_err, str(final_err))
 
 # insert_new_only: a batch with conflicts inserts nothing
 ran = []
@@ -326,10 +341,16 @@ with mock.patch.object(main, "fetch", lambda *a, **k: bad), \
      mock.patch.object(main, "insert_new_only", lambda *a, **k: (1, 0)), \
      mock.patch.object(main, "manifest", lambda **r: manifests.append(r)), \
      mock.patch.object(main, "watermark_set", lambda *a, **k: None):
-    main.run_kev()
-check("run_kev: catalog count 3 but 1 entry read -> partial, both numbers recorded",
+    try:
+        main.run_kev()
+        kev_err = None
+    except RuntimeError as e:
+        kev_err = str(e)
+check("run_kev: catalog count 3 but 1 entry read -> partial recorded, and the KEV source fails",
       manifests[-1]["status"] == "partial" and manifests[-1]["records_seen"] == 3
-      and manifests[-1]["records_in_scope"] == 1, manifests[-1].get("detail"))
+      and manifests[-1]["records_in_scope"] == 1 and kev_err is not None and "count 3" in kev_err, str(kev_err))
+check("partial is not a done status (a partial catalog is re-checked, never 'unchanged')",
+      "partial" not in main.DONE_STATUSES)
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)

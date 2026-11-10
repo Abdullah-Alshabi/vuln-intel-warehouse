@@ -74,6 +74,7 @@ T_NVD = f"{PROJECT}.{BRONZE}.nvd_records"
 T_KEV = f"{PROJECT}.{BRONZE}.kev_records"
 T_KEV_SNAP = f"{PROJECT}.{BRONZE}.kev_snapshots"   # full membership of every catalog version seen
 T_EPSS = f"{PROJECT}.{BRONZE}.epss_scores_v2"      # whole EPSS file (v1 was filtered to the cohort)
+V_EPSS_DAYS = f"{PROJECT}.{OPS}.epss_day_status"   # THE definition of a complete EPSS day (also read by Dataform)
 
 RUN_ID = os.environ.get("CLOUD_RUN_EXECUTION") or f"local-{uuid.uuid4().hex[:8]}"
 MODE = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODE", "hourly")).lower()
@@ -231,6 +232,37 @@ def ensure_tables():
                 if any(f.name not in have for f in missing):
                     raise
             info("columns added", table=table_id, columns=[f.name for f in missing])
+    ensure_views()
+
+
+def epss_day_status_sql():
+    """One row per EPSS score_date. complete = a successful load into the table, no conflict,
+    and the table holds exactly the rows the manifest says were loaded (and more than 0).
+    The extractor's gap fill and Dataform's epss_latest both read this view: one definition."""
+    return f"""
+    WITH m AS (
+      SELECT SAFE.PARSE_DATE('%Y-%m-%d', SPLIT(batch_id, ':')[SAFE_OFFSET(1)]) AS score_date,
+        COUNTIF(status = 'loaded') AS ok_loads, COUNTIF(status = 'conflicts') AS conflict_rows,
+        SUM(IF(status = 'loaded', records_new, 0)) AS loaded_rows
+      FROM `{MANIFEST}` WHERE target = '{T_EPSS}' GROUP BY 1),
+    t AS (SELECT score_date, COUNT(*) AS table_rows FROM `{T_EPSS}` GROUP BY 1)
+    SELECT score_date, IFNULL(ok_loads, 0) AS ok_loads, IFNULL(conflict_rows, 0) AS conflict_rows,
+      IFNULL(loaded_rows, 0) AS loaded_rows, IFNULL(table_rows, 0) AS table_rows,
+      (IFNULL(ok_loads, 0) > 0 AND IFNULL(conflict_rows, 0) = 0
+       AND IFNULL(table_rows, 0) > 0 AND table_rows = loaded_rows) AS complete
+    FROM m FULL OUTER JOIN t USING (score_date)
+    WHERE score_date IS NOT NULL"""
+
+
+def ensure_views():
+    """Create or refresh the views the extractor owns (definition kept in this file)."""
+    v = bigquery.Table(V_EPSS_DAYS)
+    v.view_query = epss_day_status_sql()
+    v.description = "One row per EPSS score_date; complete = loaded, no conflict, table rows = manifest rows"
+    current = bq.create_table(v, exists_ok=True)
+    if current.view_query != v.view_query:
+        current.view_query = v.view_query
+        bq.update_table(current, ["view_query"])
 
 
 def load_json_rows(table_id, rows, write="WRITE_APPEND"):
@@ -314,7 +346,8 @@ def watermark_set(source, value, changed):
         "run_id": RUN_ID, "recorded_at": iso(now())}])
 
 
-DONE_STATUSES = ("loaded", "partial")  # "conflicts" is never done: the file is re-checked every time
+DONE_STATUSES = ("loaded",)  # "conflicts"/"partial" are never done: the file is re-checked every time,
+                             # so it can never turn into "unchanged" and look healthy
 
 
 def already_loaded(sha, target):
@@ -603,7 +636,8 @@ def run_kev():
              detail=f"catalog {version}: CISA count {published}, entries read {len(records)}",
              acquired_at=iso(acquired), started_at=iso(started))
     if not count_ok:
-        error("KEV catalog count differs from the entries in the file", published=published, read=len(records))
+        raise RuntimeError(f"KEV catalog {version}: CISA count {published} but {len(records)} entries read; "
+                           "not used (the last complete catalog stays in use)")
     watermark_set("kev", version, changed=new > 0)
     return new
 
@@ -658,28 +692,17 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None, expected_dat
 
 
 def epss_gap_days(current_date):
-    """Days from COHORT_START to the day before current_date that are not complete.
-    A day is complete when the manifest has a successful load for it into this table, no
-    conflict for it, and the table holds exactly the rows the manifest says were loaded.
-    Built from the expected days (not MAX(score_date)), so a hole behind a later day is found."""
+    """Days from COHORT_START to the day before current_date that are not complete,
+    by the shared definition in ops.epss_day_status (a hole behind a later day is found)."""
     q = f"""
-    WITH days AS (
-      SELECT d FROM UNNEST(GENERATE_DATE_ARRAY(@start, DATE_SUB(@c, INTERVAL 1 DAY))) AS d),
-    m AS (
-      SELECT SAFE.PARSE_DATE('%Y-%m-%d', SPLIT(batch_id, ':')[SAFE_OFFSET(1)]) AS d,
-        COUNTIF(status = 'loaded') AS ok, COUNTIF(status = 'conflicts') AS bad,
-        SUM(IF(status = 'loaded', records_new, 0)) AS loaded
-      FROM `{MANIFEST}` WHERE target = @t GROUP BY 1),
-    t AS (SELECT score_date AS d, COUNT(*) AS n FROM `{T_EPSS}`
-          WHERE score_date >= @start AND score_date < @c GROUP BY 1)
-    SELECT FORMAT_DATE('%Y-%m-%d', days.d) AS day FROM days
-    LEFT JOIN m USING (d) LEFT JOIN t USING (d)
-    WHERE NOT (IFNULL(m.ok, 0) > 0 AND IFNULL(m.bad, 0) = 0 AND IFNULL(t.n, 0) > 0 AND t.n = m.loaded)
-    ORDER BY days.d"""
+    SELECT FORMAT_DATE('%Y-%m-%d', d) AS day
+    FROM UNNEST(GENERATE_DATE_ARRAY(@start, DATE_SUB(@c, INTERVAL 1 DAY))) AS d
+    LEFT JOIN `{V_EPSS_DAYS}` s ON s.score_date = d
+    WHERE NOT IFNULL(s.complete, FALSE)
+    ORDER BY d"""
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("start", "DATE", COHORT_START_TS.date().isoformat()),
-        bigquery.ScalarQueryParameter("c", "DATE", current_date),
-        bigquery.ScalarQueryParameter("t", "STRING", T_EPSS)])
+        bigquery.ScalarQueryParameter("c", "DATE", current_date)])
     return [r.day for r in bq.query(q, job_config=cfg).result()]
 
 
@@ -702,6 +725,11 @@ def run_epss():
                      detail=f"gap fill: {str(e)[:280]}", started_at=iso(started))
     if failed:
         raise RuntimeError(f"EPSS gap fill incomplete: missing days {failed}")
+    # Final check, same definition, including the current day itself ('unchanged' is not proof).
+    next_day = (dt.date.fromisoformat(score_date) + dt.timedelta(days=1)).isoformat()
+    still_missing = epss_gap_days(next_day)
+    if still_missing:
+        raise RuntimeError(f"EPSS days still incomplete after this run: {still_missing}")
     watermark_set("epss", score_date, changed=new > 0)
     return new
 

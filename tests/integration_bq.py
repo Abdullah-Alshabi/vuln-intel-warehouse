@@ -49,6 +49,10 @@ for r in days:
     check(f"3a. {r.score_date}: observed_at is the raw file time, earlier than processed_at",
           r.obs < r.proc, f"{r.n:,} rows, observed {r.obs:%Y-%m-%d %H:%M}, processed {r.proc:%Y-%m-%d %H:%M}")
 
+status = one(f"SELECT COUNTIF(complete) ok, COUNT(*) n FROM `{main.V_EPSS_DAYS}`")[0]
+check("3a. ops.epss_day_status (the shared definition) marks both loaded days complete",
+      status.ok == 2 and status.n == 2, f"{status.ok}/{status.n} complete")
+
 main.run_epss_reprocess()
 n2 = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
 unchanged = one(f"SELECT COUNT(*) n FROM `{main.MANIFEST}` WHERE source='epss' AND status='unchanged'")[0].n
