@@ -223,3 +223,6 @@ __marimo__/
 *.zip
 *.csv.gz
 .env
+
+# Dataform installs @dataform/core here inside its workspaces
+node_modules/
