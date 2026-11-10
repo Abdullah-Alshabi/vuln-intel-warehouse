@@ -10,8 +10,7 @@ P="vuln-intel-warehouse"
 COHORT_START="2026-10-08"
 
 read -r -d '' SQL <<EOF || true
-DECLARE cohort_start TIMESTAMP DEFAULT TIMESTAMP('${COHORT_START}');
-DECLARE hour_end TIMESTAMP DEFAULT TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR);
+-- one statement (no DECLARE): bq returns one plain result set
 WITH
 kev_obs AS (   -- the latest KEV observation (a new catalog or the same one seen again)
   SELECT batch_id FROM \`$P.ops.ingest_manifest\`
@@ -34,7 +33,7 @@ checks AS (
   UNION ALL SELECT 'cvelist', 'state is PUBLISHED or REJECTED',
     COUNTIF(state IS NULL OR state NOT IN ('PUBLISHED', 'REJECTED')) FROM \`$P.bronze.cvelist_records\`
   UNION ALL SELECT 'cvelist', 'date_published present and inside the cohort',
-    COUNTIF(date_published IS NULL OR date_published < cohort_start) FROM \`$P.bronze.cvelist_records\`
+    COUNTIF(date_published IS NULL OR date_published < TIMESTAMP('${COHORT_START}')) FROM \`$P.bronze.cvelist_records\`
   UNION ALL SELECT 'cvelist', 'date_updated not before date_published (when present)',
     COUNTIF(IFNULL(date_updated < date_published, FALSE)) FROM \`$P.bronze.cvelist_records\`
   UNION ALL SELECT 'cvelist', 'not published after we observed it (no future dates)',
@@ -80,7 +79,7 @@ checks AS (
     (SELECT COUNTIF(n > 1) FROM (SELECT score_date, COUNT(DISTINCT model_version) n
                                  FROM \`$P.bronze.epss_scores_v2\` GROUP BY 1))
   UNION ALL SELECT 'epss', 'no missing day from the cohort start to the last score_date',
-    (SELECT COUNT(*) FROM UNNEST(GENERATE_DATE_ARRAY(DATE(cohort_start),
+    (SELECT COUNT(*) FROM UNNEST(GENERATE_DATE_ARRAY(DATE(TIMESTAMP('${COHORT_START}')),
         (SELECT MAX(score_date) FROM \`$P.bronze.epss_scores_v2\`))) d
      WHERE d NOT IN (SELECT DISTINCT score_date FROM \`$P.bronze.epss_scores_v2\`))
   UNION ALL SELECT 'epss', 'each file: rows in the table = rows the manifest loaded (both directions)',
@@ -96,7 +95,7 @@ checks AS (
   UNION ALL SELECT 'ops', 'UTC hours in the last 24 complete hours without a successful hourly run',
     (SELECT 24 - COUNT(DISTINCT TIMESTAMP_TRUNC(started_at, HOUR)) FROM \`$P.ops.ingest_runs\`
      WHERE mode = 'hourly' AND status = 'succeeded'
-       AND started_at >= TIMESTAMP_SUB(hour_end, INTERVAL 24 HOUR) AND started_at < hour_end)
+       AND started_at >= TIMESTAMP_SUB(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 24 HOUR) AND started_at < TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR))
 )
 SELECT src, rule, failing FROM checks ORDER BY src, rule
 EOF
@@ -104,6 +103,8 @@ bq query --quiet --use_legacy_sql=false --format=json --max_rows=100 "$SQL" > /t
 python3 - <<'PY'
 import json, sys
 rows = json.load(open("/tmp/dq_result.json"))
+while rows and isinstance(rows[0], list):  # tolerate a nested result shape
+    rows = rows[-1]
 bad = 0
 print(f"{'src':8} {'failing':>8}  result  rule")
 for r in rows:
