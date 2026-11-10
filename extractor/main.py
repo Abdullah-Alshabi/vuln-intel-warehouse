@@ -647,9 +647,39 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None, expected_dat
     return score_date, new
 
 
+def epss_gap_days(current_date):
+    """Days missing between the last score_date we hold and the current file's date."""
+    q = f"SELECT MAX(score_date) d FROM `{T_EPSS}` WHERE score_date < @c"
+    last = list(bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("c", "DATE", current_date)])).result())[0].d
+    if last is None:  # empty table: epss_backfill is the tool for history
+        return []
+    day, end, days = last + dt.timedelta(days=1), dt.date.fromisoformat(current_date), []
+    while day < end:
+        days.append(day.isoformat())
+        day += dt.timedelta(days=1)
+    return days
+
+
 def run_epss():
+    """Load the current EPSS file, then fill any day missed since the last one we hold
+    (EPSS published late, a run failed, ...). 'Current already processed' is not proof of
+    completeness, so gaps are checked on every run."""
     started = now()
     score_date, new = ingest_epss(fetch(EPSS_CURRENT, "epss current"), "current", started)
+    failed = []
+    for day in epss_gap_days(score_date):
+        try:
+            _, n = ingest_epss(fetch(EPSS_DATED.format(day=day), f"epss {day}"), f"gap fill {day}",
+                               started, expected_date=day)
+            new += n
+            info("EPSS gap filled", score_date=day, rows=n)
+        except Exception as e:  # noqa: BLE001 - try every missing day, fail at the end
+            failed.append(day)
+            manifest(source="epss", batch_id=f"epss:{day}", status="failed", target=T_EPSS,
+                     detail=f"gap fill: {str(e)[:280]}", started_at=iso(started))
+    if failed:
+        raise RuntimeError(f"EPSS gap fill incomplete: missing days {failed}")
     watermark_set("epss", score_date, changed=new > 0)
     return new
 

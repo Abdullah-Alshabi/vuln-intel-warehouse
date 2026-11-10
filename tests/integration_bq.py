@@ -49,6 +49,12 @@ for r in days:
     check(f"3a. {r.score_date}: observed_at is the raw file time, earlier than processed_at",
           r.obs < r.proc, f"{r.n:,} rows, observed {r.obs:%Y-%m-%d %H:%M}, processed {r.proc:%Y-%m-%d %H:%M}")
 
+last_day = one(f"SELECT MAX(score_date) d FROM `{E}`")[0].d   # whichever 2 files were copied
+d = lambda k: (last_day + dt.timedelta(days=k)).isoformat()  # noqa: E731
+gaps, none = main.epss_gap_days(d(3)), main.epss_gap_days(d(1))
+check("3g. epss_gap_days finds the days missing after the last stored day (real BigQuery)",
+      gaps == [d(1), d(2)] and none == [], f"last {last_day}: {gaps} / {none}")
+
 main.run_epss_reprocess()
 n2 = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
 unchanged = one(f"SELECT COUNT(*) n FROM `{main.MANIFEST}` WHERE source='epss' AND status='unchanged'")[0].n

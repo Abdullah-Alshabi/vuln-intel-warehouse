@@ -266,5 +266,42 @@ check("run_kev: same catalog again is skipped, and the observation is still reco
       len(inserted) == 2 and manifests[1]["status"] == "unchanged"
       and manifests[1]["batch_id"] == manifests[0]["batch_id"], f"{manifests[1].get('batch_id')}")
 
+# ---------------------------------------------------------------- EPSS daily fills missed days
+calls, manifests = [], []
+with mock.patch.object(main, "fetch", lambda url, what, **k: url.encode()), \
+     mock.patch.object(main, "epss_gap_days", lambda d: ["2026-11-09"] if d == "2026-11-10" else []), \
+     mock.patch.object(main, "ingest_epss",
+                       lambda body, label, *a, **k: calls.append((label, k.get("expected_date"))) or
+                       ("2026-11-10" if label == "current" else k["expected_date"], 10)), \
+     mock.patch.object(main, "watermark_set", lambda *a, **k: None):
+    total = main.run_epss()
+check("EPSS daily: after the current file, a missed day is fetched from the dated file",
+      calls == [("current", None), ("gap fill 2026-11-09", "2026-11-09")] and total == 20, str(calls))
+
+calls = []
+with mock.patch.object(main, "fetch", lambda url, what, **k: url.encode()), \
+     mock.patch.object(main, "epss_gap_days", lambda d: ["2026-11-08", "2026-11-09"]), \
+     mock.patch.object(main, "ingest_epss",
+                       lambda body, label, *a, **k: ("2026-11-10", 1) if label == "current" else
+                       (_ for _ in ()).throw(RuntimeError("HTTP 404")) if "11-08" in label else ("2026-11-09", 1)), \
+     mock.patch.object(main, "manifest", lambda **r: manifests.append(r)), \
+     mock.patch.object(main, "watermark_set", lambda *a, **k: None):
+    try:
+        main.run_epss()
+        gap_err = None
+    except RuntimeError as e:
+        gap_err = str(e)
+check("EPSS daily: a gap day that cannot be fetched fails the run and is named",
+      gap_err is not None and "2026-11-08" in gap_err and "2026-11-09" not in gap_err
+      and manifests[-1]["status"] == "failed", str(gap_err))
+
+# epss_gap_days itself, with a fake BigQuery answer
+fake_bq = types.SimpleNamespace(query=lambda q, job_config=None: types.SimpleNamespace(
+    result=lambda: [types.SimpleNamespace(d=dt.date(2026, 11, 7))]))
+with mock.patch.object(main, "bq", fake_bq):
+    gaps = main.epss_gap_days("2026-11-10")
+check("epss_gap_days: last held 11-07, current 11-10 -> missing 11-08 and 11-09",
+      gaps == ["2026-11-08", "2026-11-09"], str(gaps))
+
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)
