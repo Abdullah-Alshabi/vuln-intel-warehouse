@@ -295,13 +295,41 @@ check("EPSS daily: a gap day that cannot be fetched fails the run and is named",
       gap_err is not None and "2026-11-08" in gap_err and "2026-11-09" not in gap_err
       and manifests[-1]["status"] == "failed", str(gap_err))
 
-# epss_gap_days itself, with a fake BigQuery answer
-fake_bq = types.SimpleNamespace(query=lambda q, job_config=None: types.SimpleNamespace(
-    result=lambda: [types.SimpleNamespace(d=dt.date(2026, 11, 7))]))
-with mock.patch.object(main, "bq", fake_bq):
-    gaps = main.epss_gap_days("2026-11-10")
-check("epss_gap_days: last held 11-07, current 11-10 -> missing 11-08 and 11-09",
-      gaps == ["2026-11-08", "2026-11-09"], str(gaps))
+# epss_gap_days: the SQL is built from expected days (the logic itself is tested on real BigQuery)
+captured = {}
+def fake_query(q, job_config=None):
+    captured["q"] = q
+    return types.SimpleNamespace(result=lambda: [types.SimpleNamespace(day="2026-11-09")])
+with mock.patch.object(main, "bq", types.SimpleNamespace(query=fake_query)):
+    gaps = main.epss_gap_days("2026-11-11")
+check("epss_gap_days: expected days come from GENERATE_DATE_ARRAY, not MAX(score_date)",
+      gaps == ["2026-11-09"] and "GENERATE_DATE_ARRAY" in captured["q"] and "MAX(score_date)" not in captured["q"])
+
+# insert_new_only: a batch with conflicts inserts nothing
+ran = []
+def q2(q, job_config=None):
+    ran.append("INSERT" if q.startswith("INSERT") else "CHECK")
+    return types.SimpleNamespace(result=lambda: [types.SimpleNamespace(n=2)], num_dml_affected_rows=0)
+fake = types.SimpleNamespace(query=q2, create_table=lambda *a, **k: None, delete_table=lambda *a, **k: None)
+with mock.patch.object(main, "bq", fake), mock.patch.object(main, "load_json_rows", lambda *a, **k: None):
+    res = main.insert_new_only(main.T_EPSS, [{"cve_id": "x"}], ["cve_id", "score_date"], compare_cols=["epss"])
+check("insert_new_only: with conflicts, the INSERT is never run", res == (0, 2) and "INSERT" not in ran, str(ran))
+check("conflicts is not a done status (a conflicting file is re-checked, never 'unchanged')",
+      "conflicts" not in main.DONE_STATUSES)
+
+# run_kev: CISA's own count is compared with the entries read
+bad = json.dumps({"catalogVersion": "x", "count": 3, "vulnerabilities": [{"cveID": "CVE-1"}]}).encode()
+manifests = []
+with mock.patch.object(main, "fetch", lambda *a, **k: bad), \
+     mock.patch.object(main, "land", lambda *a, **k: ("gs://raw/kev", T)), \
+     mock.patch.object(main, "already_loaded", lambda *a: False), \
+     mock.patch.object(main, "insert_new_only", lambda *a, **k: (1, 0)), \
+     mock.patch.object(main, "manifest", lambda **r: manifests.append(r)), \
+     mock.patch.object(main, "watermark_set", lambda *a, **k: None):
+    main.run_kev()
+check("run_kev: catalog count 3 but 1 entry read -> partial, both numbers recorded",
+      manifests[-1]["status"] == "partial" and manifests[-1]["records_seen"] == 3
+      and manifests[-1]["records_in_scope"] == 1, manifests[-1].get("detail"))
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)

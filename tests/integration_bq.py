@@ -49,12 +49,6 @@ for r in days:
     check(f"3a. {r.score_date}: observed_at is the raw file time, earlier than processed_at",
           r.obs < r.proc, f"{r.n:,} rows, observed {r.obs:%Y-%m-%d %H:%M}, processed {r.proc:%Y-%m-%d %H:%M}")
 
-last_day = one(f"SELECT MAX(score_date) d FROM `{E}`")[0].d   # whichever 2 files were copied
-d = lambda k: (last_day + dt.timedelta(days=k)).isoformat()  # noqa: E731
-gaps, none = main.epss_gap_days(d(3)), main.epss_gap_days(d(1))
-check("3g. epss_gap_days finds the days missing after the last stored day (real BigQuery)",
-      gaps == [d(1), d(2)] and none == [], f"last {last_day}: {gaps} / {none}")
-
 main.run_epss_reprocess()
 n2 = one(f"SELECT COUNT(*) n FROM `{E}`")[0].n
 unchanged = one(f"SELECT COUNT(*) n FROM `{main.MANIFEST}` WHERE source='epss' AND status='unchanged'")[0].n
@@ -93,8 +87,8 @@ check("3d. a different model_version alone is also a conflict", new == 0 and con
 fresh = [dict(r, score_date="2001-01-01") for r in rows[:2]]
 clash = fresh + [dict(fresh[0], epss=0.999)]     # same key twice in one batch, different values
 new, conflicts = main.insert_new_only(E, clash, ["cve_id", "score_date"], compare_cols=CMP)
-check("3d. one key with two different values inside a first batch is reported",
-      conflicts == 1, f"new {new}, conflicts {conflicts}")
+check("3d. one key with two different values inside a first batch: reported and NOTHING inserted",
+      conflicts == 1 and new == 0, f"new {new}, conflicts {conflicts}")
 
 dup = rows[:3] + rows[:3]
 new, _ = main.insert_new_only(E, [dict(r, score_date="2000-01-01") for r in dup], ["cve_id", "score_date"])
@@ -104,6 +98,26 @@ size = bq.get_table(E)
 check("3f. size per EPSS day (measured)", True,
       f"{size.num_rows:,} rows, {size.num_bytes / 1e6:.1f} MB logical in total "
       f"= {size.num_bytes / max(1, len(days)) / 1e6:.1f} MB per day")
+
+X = dt.date(1999, 1, 1)                         # synthetic days, far from real data
+day = lambda k: (X + dt.timedelta(days=k)).isoformat()  # noqa: E731
+def put(k, n_rows, loaded, status="loaded"):
+    rows = [{"cve_id": f"CVE-1999-{k}{i:04d}", "epss": 0.1, "percentile": 0.5, "score_date": day(k),
+             "model_version": "t", "batch_id": f"epss:{day(k)}:test", "observed_at": main.iso(main.now()),
+             "processed_at": main.iso(main.now())} for i in range(n_rows)]
+    main.insert_new_only(E, rows, ["cve_id", "score_date"])
+    main.manifest(source="epss", batch_id=f"epss:{day(k)}:test", status=status, records_new=loaded, target=E)
+put(0, 3, 3)                                                     # complete
+main.manifest(source="epss", batch_id=f"epss:{day(1)}", status="failed", target=E)   # failed, never loaded
+put(2, 2, 2)                                                     # complete, AFTER the hole
+put(3, 2, 3)                                                     # table has 2 rows, manifest says 3
+put(4, 2, 2); main.manifest(source="epss", batch_id=f"epss:{day(4)}:test2", status="conflicts", target=E)
+saved_start = main.COHORT_START_TS
+main.COHORT_START_TS = dt.datetime(1999, 1, 1, tzinfo=dt.timezone.utc)
+gaps = main.epss_gap_days(day(5))
+main.COHORT_START_TS = saved_start
+check("3g. gap days on real BigQuery: a failed day behind a later good day, a row-count mismatch, "
+      "and a conflict day are all reported", gaps == [day(1), day(3), day(4)], str(gaps))
 
 # ------------------------------------------------------------ 4. KEV membership per catalog version
 t1 = dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc)
@@ -132,6 +146,18 @@ check("4c. B's earlier membership is still stored", kept == 1, kept)
 _, _, members = main.kev_rows(v2, "b" * 64, t2, main.now())
 new, _ = main.insert_new_only(main.T_KEV_SNAP, members, ["batch_id", "cve_id"])
 check("4d. loading the same catalog again adds nothing", new == 0, new)
+
+# A -> B -> A: the manifest is the observation log; catalog A seen again is recorded 'unchanged'
+t3 = dt.datetime(2026, 11, 3, 12, tzinfo=dt.timezone.utc)
+bA, bB = f"kev:test.1:{'a' * 12}", f"kev:test.2:{'b' * 12}"
+for batch, status, t in ((bA, "loaded", t1), (bB, "loaded", t2), (bA, "unchanged", t3)):
+    main.manifest(source="kev", batch_id=batch, status=status, target=main.T_KEV, finished_at=main.iso(t))
+OBS = (f"SELECT ARRAY_AGG(cve_id ORDER BY cve_id) m FROM `{main.T_KEV_SNAP}` WHERE batch_id = ("
+       f"SELECT batch_id FROM `{main.MANIFEST}` WHERE source = 'kev' AND status IN ('loaded', 'unchanged') "
+       f"AND finished_at <= @c ORDER BY finished_at DESC LIMIT 1)")
+seq = [one(OBS, c=t + dt.timedelta(hours=1))[0].m for t in (t1, t2, t3)]
+check("4e. A -> B -> A: membership as of each observation is A, then B, then A again",
+      seq == [["CVE-T-A", "CVE-T-B", "CVE-T-C"], ["CVE-T-A", "CVE-T-C"], ["CVE-T-A", "CVE-T-B", "CVE-T-C"]], seq)
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)

@@ -49,6 +49,7 @@ COHORT_START = os.environ.get("COHORT_START", "2026-10-08")  # launch date minus
 NVD_API_KEY = os.environ.get("NVD_API_KEY", "").strip()      # from Secret Manager
 DATAFORM_REPO = os.environ.get("DATAFORM_REPO", "")           # empty = do not start Dataform
 DATAFORM_BRANCH = os.environ.get("DATAFORM_BRANCH", "main")
+DATAFORM_SA = os.environ.get("DATAFORM_SA", f"dataform-sa@{PROJECT}.iam.gserviceaccount.com")
 BRONZE = os.environ.get("BRONZE_DATASET", "bronze")          # overridable for integration tests
 OPS = os.environ.get("OPS_DATASET", "ops")
 GIT_SHA = os.environ.get("GIT_SHA", "unknown")                # set by Cloud Build on deploy
@@ -267,8 +268,9 @@ def insert_sql(table_id, stage, key_cols, compare_cols=()):
 def insert_new_only(table_id, rows, key_cols, compare_cols=()):
     """Load rows to a staging table, then insert only rows whose key is not in the target.
     Returns (new_rows, conflicting_rows). Re-running with the same input inserts nothing.
-    conflicting_rows: key already stored with different compare_cols values; the stored
-    value is kept and the caller reports the conflict instead of silently accepting it."""
+    conflicting_rows: a key already stored with other compare_cols values, or one key with
+    different values inside the batch. Then NOTHING from the batch is inserted; the raw file
+    is kept and the caller records the conflict and fails."""
     if not rows:
         return 0, 0
     stage = f"{PROJECT}.{BRONZE}.stage_{table_id.split('.')[-1]}_{uuid.uuid4().hex[:8]}"
@@ -278,6 +280,8 @@ def insert_new_only(table_id, rows, key_cols, compare_cols=()):
         load_json_rows(stage, rows, write="WRITE_TRUNCATE")
         conflict_q, insert_q = insert_sql(table_id, stage, key_cols, compare_cols)
         conflicts = list(bq.query(conflict_q).result())[0].n if conflict_q else 0
+        if conflicts:  # nothing from a batch with conflicting values reaches the table
+            return 0, conflicts
         job = bq.query(insert_q)
         job.result()
         return job.num_dml_affected_rows or 0, conflicts
@@ -310,7 +314,7 @@ def watermark_set(source, value, changed):
         "run_id": RUN_ID, "recorded_at": iso(now())}])
 
 
-DONE_STATUSES = ("loaded", "partial", "conflicts")
+DONE_STATUSES = ("loaded", "partial")  # "conflicts" is never done: the file is re-checked every time
 
 
 def already_loaded(sha, target):
@@ -588,12 +592,18 @@ def run_kev():
     batch_id, records, members = kev_rows(d, file_sha, acquired, now())
     for r in records:
         r["file_uri"] = file_uri
+    published = d.get("count")
+    count_ok = published == len(records)
     new, _ = insert_new_only(T_KEV, records, ["cve_id", "record_hash"])
     insert_new_only(T_KEV_SNAP, members, ["batch_id", "cve_id"])
     manifest(source="kev", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
-             records_seen=len(records), records_in_scope=len(records), records_new=new, status="loaded",
-             target=T_KEV, detail=f"{len(members)} members in catalog {version}", acquired_at=iso(acquired),
-             started_at=iso(started))
+             records_seen=published, records_in_scope=len(records), records_new=new,
+             records_failed=0 if count_ok else abs((published or 0) - len(records)),
+             status="loaded" if count_ok else "partial", target=T_KEV,
+             detail=f"catalog {version}: CISA count {published}, entries read {len(records)}",
+             acquired_at=iso(acquired), started_at=iso(started))
+    if not count_ok:
+        error("KEV catalog count differs from the entries in the file", published=published, read=len(records))
     watermark_set("kev", version, changed=new > 0)
     return new
 
@@ -648,17 +658,29 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None, expected_dat
 
 
 def epss_gap_days(current_date):
-    """Days missing between the last score_date we hold and the current file's date."""
-    q = f"SELECT MAX(score_date) d FROM `{T_EPSS}` WHERE score_date < @c"
-    last = list(bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("c", "DATE", current_date)])).result())[0].d
-    if last is None:  # empty table: epss_backfill is the tool for history
-        return []
-    day, end, days = last + dt.timedelta(days=1), dt.date.fromisoformat(current_date), []
-    while day < end:
-        days.append(day.isoformat())
-        day += dt.timedelta(days=1)
-    return days
+    """Days from COHORT_START to the day before current_date that are not complete.
+    A day is complete when the manifest has a successful load for it into this table, no
+    conflict for it, and the table holds exactly the rows the manifest says were loaded.
+    Built from the expected days (not MAX(score_date)), so a hole behind a later day is found."""
+    q = f"""
+    WITH days AS (
+      SELECT d FROM UNNEST(GENERATE_DATE_ARRAY(@start, DATE_SUB(@c, INTERVAL 1 DAY))) AS d),
+    m AS (
+      SELECT SAFE.PARSE_DATE('%Y-%m-%d', SPLIT(batch_id, ':')[SAFE_OFFSET(1)]) AS d,
+        COUNTIF(status = 'loaded') AS ok, COUNTIF(status = 'conflicts') AS bad,
+        SUM(IF(status = 'loaded', records_new, 0)) AS loaded
+      FROM `{MANIFEST}` WHERE target = @t GROUP BY 1),
+    t AS (SELECT score_date AS d, COUNT(*) AS n FROM `{T_EPSS}`
+          WHERE score_date >= @start AND score_date < @c GROUP BY 1)
+    SELECT FORMAT_DATE('%Y-%m-%d', days.d) AS day FROM days
+    LEFT JOIN m USING (d) LEFT JOIN t USING (d)
+    WHERE NOT (IFNULL(m.ok, 0) > 0 AND IFNULL(m.bad, 0) = 0 AND IFNULL(t.n, 0) > 0 AND t.n = m.loaded)
+    ORDER BY days.d"""
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("start", "DATE", COHORT_START_TS.date().isoformat()),
+        bigquery.ScalarQueryParameter("c", "DATE", current_date),
+        bigquery.ScalarQueryParameter("t", "STRING", T_EPSS)])
+    return [r.day for r in bq.query(q, job_config=cfg).result()]
 
 
 def run_epss():
@@ -735,10 +757,14 @@ def run_dataform():
     comp = comp.json()
     if comp.get("compilationErrors"):
         raise RuntimeError(f"Dataform compilation errors: {comp['compilationErrors'][:3]}")
-    inv = s.post(f"{base}/workflowInvocations", json={"compilationResult": comp["name"]}, timeout=120)
-    inv.raise_for_status()
+    commit = comp.get("resolvedGitCommitSha")  # the exact SQL version, not just "main"
+    inv = s.post(f"{base}/workflowInvocations", timeout=120, json={
+        "compilationResult": comp["name"],
+        "invocationConfig": {"serviceAccount": DATAFORM_SA}})  # strict act-as: run as dataform-sa
+    if inv.status_code >= 400:
+        raise RuntimeError(f"Dataform invocation refused: HTTP {inv.status_code} {inv.text[:300]}")
     name = inv.json()["name"]
-    info("dataform started", invocation=name)
+    info("dataform started", invocation=name, commit=commit, service_account=DATAFORM_SA)
     for _ in range(180):
         time.sleep(10)
         state = s.get(f"https://dataform.googleapis.com/v1beta1/{name}", timeout=60).json().get("state")
@@ -746,7 +772,7 @@ def run_dataform():
             info("dataform finished", invocation=name, state=state)
             if state != "SUCCEEDED":
                 raise RuntimeError(f"Dataform workflow {state}")
-            return
+            return {"invocation": name, "commit": commit}
     raise RuntimeError("Dataform workflow timed out")
 
 
@@ -770,6 +796,14 @@ def run_daily():
     return sum(results.values())
 
 
+def run_dataform_only():
+    """Run the Dataform workflow on its own (to test the automated path and its identity)."""
+    if not DATAFORM_REPO:
+        raise RuntimeError("DATAFORM_REPO is not set")
+    run_dataform()
+    return 0
+
+
 RUNNERS = {
     "cvelist_baseline": lambda: run_cvelist("baseline"),
     "hourly": lambda: run_cvelist("delta"),
@@ -779,6 +813,7 @@ RUNNERS = {
     "epss": run_epss,
     "epss_reprocess": run_epss_reprocess,
     "epss_backfill": run_epss_backfill,
+    "dataform": lambda: run_dataform_only(),
 }
 # Modes that write the same tables share one lock.
 LOCK_FOR = {"hourly": "cvelist", "cvelist_baseline": "cvelist",

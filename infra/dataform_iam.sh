@@ -26,7 +26,8 @@ NUM=$(gcloud projects describe "$P" --format='value(projectNumber)')
 AGENT="service-${NUM}@gcp-sa-dataform.iam.gserviceaccount.com"
 
 say "Dataform service agent"
-gcloud beta services identity create --service=dataform.googleapis.com --project="$P" >/dev/null 2>&1 || true
+# Returns the existing agent if it is already there; any other error stops the script.
+gcloud beta services identity create --service=dataform.googleapis.com --project="$P" >/dev/null
 echo "  $AGENT"
 
 say "GitHub token in Secret Manager (never printed)"
@@ -62,9 +63,17 @@ bq_grant() {  # role, dataset
 }
 bq_grant roles/bigquery.dataViewer bronze
 for ds in silver gold ops; do bq_grant roles/bigquery.dataEditor "$ds"; done
-gcloud projects remove-iam-policy-binding "$P" \
-  --member="serviceAccount:$(sa dataform-sa)" --role="roles/bigquery.dataEditor" --condition=None >/dev/null 2>&1 \
-  && echo "  dataform-sa: removed project-wide bigquery.dataEditor" || echo "  (project-wide dataEditor was already gone)"
+has_wide_role() {
+  gcloud projects get-iam-policy "$P" --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$(sa dataform-sa) AND bindings.role:roles/bigquery.dataEditor" \
+    --format="value(bindings.role)" | grep -q .
+}
+if has_wide_role; then
+  gcloud projects remove-iam-policy-binding "$P" \
+    --member="serviceAccount:$(sa dataform-sa)" --role="roles/bigquery.dataEditor" --condition=None >/dev/null
+fi
+if has_wide_role; then echo "  ERROR: project-wide bigquery.dataEditor is still there" >&2; exit 1; fi
+echo "  dataform-sa: no project-wide bigquery.dataEditor (verified)"
 
 say "Check: dataform-sa project roles (expect only bigquery.jobUser)"
 gcloud projects get-iam-policy "$P" --flatten="bindings[].members" \

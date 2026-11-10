@@ -9,6 +9,9 @@ config {
     ingestion_source: "Where we read the score: cvelist (CVE.org) or nvd (NVD API)",
     provider_role: "CNA or ADP (cvelist); NVD or non-NVD (nvd, by the metric's source field)",
     metric_provider: "Who wrote the score: CNA/ADP short name in cvelist, the 'source' field in NVD",
+    provider_label: "Readable provider: CISA-ADP when NVD's source is CISA ADP's orgId, else metric_provider",
+    metric_position: "Position of the score in its source list (keeps several scores of one record apart)",
+    scenarios: "CVE record 'scenarios' of the score (e.g. GENERAL), as JSON text; NULL in NVD",
     provider_org_id: "CVE.org organisation UUID of the provider (cvelist only)",
     nvd_type: "NVD's Primary/Secondary label (NVD only). Primary does not mean NVD wrote it",
     cvss_version: "4.0, 3.1, 3.0 or 2.0, from the field the score was found in",
@@ -20,11 +23,11 @@ config {
     observed_at: "When we first had the file this version came from"
   },
   assertions: {
-    nonNull: ["cve_id", "record_hash", "ingestion_source", "cvss_version", "observed_at"],
+    nonNull: ["cve_id", "record_hash", "ingestion_source", "cvss_version", "observed_at", "base_score", "vector"],
     rowConditions: [
       "base_score BETWEEN 0 AND 10",
       "cvss_version IN ('4.0', '3.1', '3.0', '2.0')",
-      "declared_version IS NULL OR STARTS_WITH(declared_version, LEFT(cvss_version, 1))"
+      "declared_version IS NULL OR declared_version = cvss_version"
     ]
   }
 }
@@ -40,23 +43,25 @@ cve_metric_objects AS (
     'CNA' AS provider_role,
     JSON_VALUE(c.record, '$.containers.cna.providerMetadata.shortName') AS metric_provider,
     JSON_VALUE(c.record, '$.containers.cna.providerMetadata.orgId') AS provider_org_id,
-    m AS metric
-  FROM cvelist c, UNNEST(JSON_QUERY_ARRAY(c.record, '$.containers.cna.metrics')) AS m
+    m AS metric, pos AS metric_position
+  FROM cvelist c, UNNEST(JSON_QUERY_ARRAY(c.record, '$.containers.cna.metrics')) AS m WITH OFFSET AS pos
   UNION ALL
   SELECT c.cve_id, c.record_hash, c.source_updated_at, c.observed_at,
     'ADP',
     JSON_VALUE(a, '$.providerMetadata.shortName'),
     JSON_VALUE(a, '$.providerMetadata.orgId'),
-    m
+    m, apos * 1000 + pos
   FROM cvelist c,
-    UNNEST(JSON_QUERY_ARRAY(c.record, '$.containers.adp')) AS a,
-    UNNEST(JSON_QUERY_ARRAY(a, '$.metrics')) AS m
+    UNNEST(JSON_QUERY_ARRAY(c.record, '$.containers.adp')) AS a WITH OFFSET AS apos,
+    UNNEST(JSON_QUERY_ARRAY(a, '$.metrics')) AS m WITH OFFSET AS pos
 ),
 
 -- Each metrics item holds at most one CVSS object, under a key that names its version.
 cve_side AS (
   SELECT o.cve_id, o.record_hash, 'cvelist' AS ingestion_source, o.provider_role, o.metric_provider,
-    o.provider_org_id, CAST(NULL AS STRING) AS nvd_type, k.ver AS cvss_version, k.obj AS cvss,
+    o.provider_org_id, CAST(NULL AS STRING) AS nvd_type, o.metric_position,
+    IF(JSON_QUERY(o.metric, '$.scenarios') IS NULL, NULL, TO_JSON_STRING(JSON_QUERY(o.metric, '$.scenarios'))) AS scenarios,
+    k.ver AS cvss_version, k.obj AS cvss,
     CAST(NULL AS STRING) AS outer_severity, o.source_updated_at, o.observed_at
   FROM cve_metric_objects o,
     UNNEST([STRUCT('4.0' AS ver, JSON_QUERY(o.metric, '$.cvssV4_0') AS obj),
@@ -73,6 +78,8 @@ nvd_side AS (
     JSON_VALUE(m, '$.source') AS metric_provider,
     CAST(NULL AS STRING) AS provider_org_id,
     JSON_VALUE(m, '$.type') AS nvd_type,
+    pos AS metric_position,
+    CAST(NULL AS STRING) AS scenarios,
     k.ver AS cvss_version,
     JSON_QUERY(m, '$.cvssData') AS cvss,
     JSON_VALUE(m, '$.baseSeverity') AS outer_severity,  -- CVSS 2.0 keeps severity outside cvssData
@@ -82,7 +89,7 @@ nvd_side AS (
             STRUCT('3.1', JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV31')),
             STRUCT('3.0', JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV30')),
             STRUCT('2.0', JSON_QUERY_ARRAY(n.record, '$.metrics.cvssMetricV2'))]) AS k,
-    UNNEST(k.arr) AS m
+    UNNEST(k.arr) AS m WITH OFFSET AS pos
 ),
 
 all_scores AS (
@@ -92,7 +99,11 @@ all_scores AS (
 )
 
 SELECT
-  cve_id, record_hash, ingestion_source, provider_role, metric_provider, provider_org_id, nvd_type,
+  cve_id, record_hash, ingestion_source, provider_role, metric_provider,
+  -- CISA ADP's CVE.org orgId appears as the 'source' of its scores in NVD
+  -- (documented in CISA's vulnrichment repository records)
+  IF(metric_provider = '134c704f-9b21-4f2e-91b3-4a467353bcc0', 'CISA-ADP', metric_provider) AS provider_label,
+  provider_org_id, nvd_type, metric_position, scenarios,
   cvss_version,
   JSON_VALUE(cvss, '$.version') AS declared_version,
   SAFE_CAST(JSON_VALUE(cvss, '$.baseScore') AS FLOAT64) AS base_score,
