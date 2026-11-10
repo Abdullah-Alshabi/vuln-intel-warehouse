@@ -10,8 +10,7 @@ P="vuln-intel-warehouse"
 COHORT_START="2026-10-08"
 
 read -r -d '' SQL <<EOF || true
--- one statement (no DECLARE): bq returns one plain result set
-WITH
+WITH  -- one statement (no DECLARE), and must not start with '--' (bq reads it as a flag)
 kev_obs AS (   -- the latest KEV observation (a new catalog or the same one seen again)
   SELECT batch_id FROM \`$P.ops.ingest_manifest\`
   WHERE source = 'kev' AND status IN ('loaded', 'unchanged') AND batch_id LIKE 'kev:%:%'
