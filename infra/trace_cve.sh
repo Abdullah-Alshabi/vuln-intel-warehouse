@@ -21,21 +21,21 @@ fi
 echo "Tracing ${CVE}"
 
 q "BRONZE cvelist: every version we stored (newest first)" "
-SELECT state, date_published, date_updated, SUBSTR(record_hash, 1, 12) hash, batch_id, observed_at
+SELECT state, date_published, date_updated, SUBSTR(record_hash, 1, 12) hash12, batch_id, observed_at
 FROM \`$P.bronze.cvelist_records\` WHERE cve_id = @cve
 ORDER BY COALESCE(date_updated, date_published) DESC, observed_at DESC, record_hash DESC   -- same order as silver"
 
 q "SILVER cve_latest: the version chosen (its hash must be the first one above)" "
 SELECT state, date_published, date_updated, assigner, first_listed_vendor, first_listed_product, versions_stored,
-  SUBSTR(record_hash, 1, 12) hash, SUBSTR(description, 1, 120) description
+  SUBSTR(record_hash, 1, 12) hash12, SUBSTR(description, 1, 120) description
 FROM \`$P.silver.cve_latest\` WHERE cve_id = @cve"
 
 q "BRONZE nvd: every version we stored" "
-SELECT vuln_status, last_modified, SUBSTR(record_hash, 1, 12) hash, observed_at
+SELECT vuln_status, last_modified, SUBSTR(record_hash, 1, 12) hash12, observed_at
 FROM \`$P.bronze.nvd_records\` WHERE cve_id = @cve ORDER BY last_modified DESC, observed_at DESC, record_hash DESC"
 
 q "SILVER nvd_latest" "
-SELECT nvd_status, nvd_last_modified, SUBSTR(record_hash, 1, 12) hash FROM \`$P.silver.nvd_latest\` WHERE cve_id = @cve"
+SELECT nvd_status, nvd_last_modified, SUBSTR(record_hash, 1, 12) hash12 FROM \`$P.silver.nvd_latest\` WHERE cve_id = @cve"
 
 q "SILVER kev_current (no row = not in the latest valid KEV catalog)" "
 SELECT catalog_version, kev_checked_at, date_added, ransomware_use FROM \`$P.silver.kev_current\` WHERE cve_id = @cve"
