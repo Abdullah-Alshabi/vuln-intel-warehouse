@@ -19,3 +19,5 @@ UNION ALL
 SELECT 'duplicate CVE in the candidate', cve_id FROM candidate GROUP BY cve_id HAVING COUNT(*) > 1
 UNION ALL
 SELECT 'candidate is empty', CAST(NULL AS STRING) FROM (SELECT COUNT(*) AS n FROM candidate) WHERE n = 0
+UNION ALL
+SELECT 'DELIBERATE FAILURE TEST (branch test/gate-failure only, never merge)', CAST(NULL AS STRING)
