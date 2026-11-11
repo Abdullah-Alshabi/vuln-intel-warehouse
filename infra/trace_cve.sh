@@ -55,3 +55,8 @@ WHERE m.cve_id = @cve AND m.record_hash IN (
   SELECT record_hash FROM \`$P.silver.cve_latest\` WHERE cve_id = @cve
   UNION ALL SELECT record_hash FROM \`$P.silver.nvd_latest\` WHERE cve_id = @cve)
 ORDER BY m.cvss_version DESC, m.ingestion_source, m.provider_role"
+
+q "SILVER cvss_selected: the one score chosen by the rule" "
+SELECT cvss_score, cvss_version, cvss_severity, cvss_provider, cvss_provider_role, cvss_via, cvss_is_fallback,
+  selection_reason
+FROM \`$P.silver.cvss_selected\` WHERE cve_id = @cve"

@@ -1,0 +1,105 @@
+config {
+  type: "table",
+  schema: "silver",
+  description: "One CVSS score per CVE, chosen by the project's documented rule from the scores of the CHOSEN record versions only (cve_latest and nvd_latest). Rule: version 4.0, then 3.1, 3.0, 2.0; within a version: CNA via cvelist, CISA-ADP via cvelist, NVD-authored, another ADP via cvelist, then a non-NVD score via NVD (fallback); then the GENERAL scenario (an unspecified scenario counts as GENERAL); then the highest base score among equally ranked candidates. This is a project policy, not proof that one provider or version is more accurate. A CVE with no valid score has no row here (NULL in gold, never 0).",
+  bigquery: { clusterBy: ["cve_id"] },
+  columns: {
+    cve_id: "CVE identifier",
+    cvss_score: "The chosen CVSS base score, 0 to 10",
+    cvss_version: "CVSS version of the chosen score: 4.0, 3.1, 3.0 or 2.0 (scores of different versions are not comparable)",
+    cvss_severity: "Severity text given by the source with this same score (e.g. HIGH); NULL if the source gave none",
+    cvss_vector: "CVSS vector string of the chosen score (for tracing)",
+    cvss_provider: "Who wrote the score: CNA/ADP short name (or its CVE.org orgId if no name), or NVD's source field",
+    cvss_provider_role: "CNA, ADP (CISA-ADP or another ADP), NVD (written by NVD) or non-NVD (another party, read via NVD)",
+    cvss_via: "Where we read it: cvelist (CVE.org) or nvd (NVD API)",
+    cvss_is_fallback: "TRUE when the score is a non-NVD score read via NVD, the last option of the rule",
+    selection_reason: "Why this score was chosen, in plain words",
+    record_hash: "Fingerprint of the record version the score belongs to (joins to bronze and cve_metrics)"
+  },
+  assertions: {
+    uniqueKey: ["cve_id"],
+    nonNull: ["cve_id", "cvss_score", "cvss_version", "cvss_vector", "cvss_provider", "cvss_via",
+              "selection_reason", "record_hash"],
+    rowConditions: ["cvss_score BETWEEN 0 AND 10", "cvss_version IN ('4.0', '3.1', '3.0', '2.0')"]
+  }
+}
+
+-- 134c704f-9b21-4f2e-91b3-4a467353bcc0 is CISA ADP's CVE.org organisation id
+WITH chosen_metrics AS (   -- scores of the chosen versions only: joined on cve_id + record_hash + source
+  SELECT m.*
+  FROM ${ref("cve_metrics")} m
+  JOIN ${ref("cve_latest")} c
+    ON m.ingestion_source = 'cvelist' AND m.cve_id = c.cve_id AND m.record_hash = c.record_hash
+  UNION ALL
+  SELECT m.*
+  FROM ${ref("cve_metrics")} m
+  JOIN ${ref("nvd_latest")} n
+    ON m.ingestion_source = 'nvd' AND m.cve_id = n.cve_id AND m.record_hash = n.record_hash
+),
+
+ranked AS (
+  SELECT
+    *,
+    CASE cvss_version WHEN '4.0' THEN 1 WHEN '3.1' THEN 2 WHEN '3.0' THEN 3 ELSE 4 END AS version_rank,
+    CASE
+      WHEN ingestion_source = 'cvelist' AND provider_role = 'CNA' THEN 1
+      WHEN ingestion_source = 'cvelist' AND provider_role = 'ADP'
+           AND provider_org_id = '134c704f-9b21-4f2e-91b3-4a467353bcc0' THEN 2   -- CISA-ADP
+      WHEN ingestion_source = 'nvd' AND provider_role = 'NVD' THEN 3
+      WHEN ingestion_source = 'cvelist' AND provider_role = 'ADP' THEN 4                -- another ADP
+      ELSE 5                                                                            -- non-NVD via NVD
+    END AS provider_rank,
+    -- An unspecified scenario means GENERAL in the CVE schema; read the JSON values, not text search
+    IF(scenarios IS NULL
+       OR ARRAY_LENGTH(JSON_QUERY_ARRAY(PARSE_JSON(scenarios))) = 0
+       OR EXISTS (SELECT 1 FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(scenarios))) AS s
+                  WHERE UPPER(JSON_VALUE(s, '$.value')) = 'GENERAL'),
+       1, 2) AS scenario_rank,
+    COALESCE(provider_label, provider_org_id, metric_provider) AS provider_id
+  FROM chosen_metrics
+  WHERE base_score IS NOT NULL
+),
+
+with_tier AS (             -- how many different scores share the best rank (to explain the choice)
+  SELECT
+    *,
+    COUNT(DISTINCT CONCAT(CAST(base_score AS STRING), '|', vector))
+      OVER (PARTITION BY cve_id, version_rank, provider_rank, scenario_rank) AS tier_candidates
+  FROM ranked
+),
+
+chosen AS (
+  SELECT *
+  FROM with_tier
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY cve_id
+    ORDER BY version_rank, provider_rank, scenario_rank, base_score DESC,
+             provider_id, metric_position, vector, record_hash) = 1
+)
+
+SELECT
+  cve_id,
+  base_score AS cvss_score,
+  cvss_version,
+  base_severity AS cvss_severity,
+  vector AS cvss_vector,
+  provider_id AS cvss_provider,
+  CASE provider_rank WHEN 1 THEN 'CNA' WHEN 2 THEN 'ADP' WHEN 3 THEN 'NVD' WHEN 4 THEN 'ADP' ELSE 'non-NVD' END
+    AS cvss_provider_role,
+  ingestion_source AS cvss_via,
+  provider_rank = 5 AS cvss_is_fallback,
+  CONCAT(
+    'v', cvss_version, ' from ',
+    CASE provider_rank
+      WHEN 1 THEN CONCAT('CNA (', provider_id, ')')
+      WHEN 2 THEN 'CISA-ADP'
+      WHEN 3 THEN 'NVD (written by NVD)'
+      WHEN 4 THEN CONCAT('another ADP (', provider_id, ')')
+      ELSE CONCAT(provider_id, ', non-NVD fallback')
+    END,
+    ' via ', ingestion_source,
+    IF(scenario_rank = 1, '; GENERAL/default scenario', '; specific scenario (no GENERAL score)'),
+    IF(tier_candidates > 1, '; highest score among equally ranked candidates', '')
+  ) AS selection_reason,
+  record_hash
+FROM chosen
