@@ -42,7 +42,7 @@ echo "  workflow: ${STATE}"
 call "https://dataform.googleapis.com/v1beta1/${INV_NAME}:query" | python3 -c '
 import json, sys
 for a in json.load(sys.stdin).get("workflowInvocationActions", []):
-    t = a.get("target", {})
-    print(f"  {a.get(\"state\", \"?\"):10} {t.get(\"schema\")}.{t.get(\"name\")}", ("-> " + a["failureReason"][:200]) if a.get("failureReason") else "")
+    t, state, why = a.get("target", {}), a.get("state", "?"), a.get("failureReason", "")
+    print("  %-10s %s.%s %s" % (state, t.get("schema"), t.get("name"), ("-> " + why[:200]) if why else ""))
 '
 [[ "$STATE" == "SUCCEEDED" ]]
