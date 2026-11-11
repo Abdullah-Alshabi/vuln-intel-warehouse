@@ -5,3 +5,6 @@ defaultLocation: us-central1
 defaultDataset: silver
 defaultAssertionDataset: ops
 dataformCoreVersion: 3.0.0
+vars:
+  # Must equal COHORT_START of the extractor (Cloud Run Job env var): the first publication day in scope.
+  cohort_start: "2026-10-08"

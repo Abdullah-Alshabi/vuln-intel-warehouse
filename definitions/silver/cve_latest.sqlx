@@ -1,0 +1,67 @@
+config {
+  type: "table",
+  schema: "silver",
+  description: "The latest stored version of each CVE record from CVE.org (cvelistV5), one row per CVE in scope. Latest = newest dateUpdated, then the newest observation. Rejected CVEs are kept here (state = REJECTED) and removed in gold.",
+  bigquery: { clusterBy: ["cve_id"] },
+  columns: {
+    cve_id: "CVE identifier, e.g. CVE-2026-12345",
+    state: "PUBLISHED or REJECTED, from cveMetadata.state of the chosen version",
+    date_published: "When CVE.org published the CVE (UTC). Defines the scope: on or after the cohort start",
+    date_updated: "When the CVE record was last changed at the source (UTC); NULL if the record never says",
+    date_rejected: "When the CVE was rejected (UTC); NULL unless state = REJECTED",
+    assigner: "Short name of the CNA that owns the record (e.g. microsoft, VulnCheck)",
+    title: "Short title written by the CNA; NULL when the CNA gave none",
+    description: "English description written by the CNA; NULL when there is no English description",
+    vendor: "Vendor of the first affected product listed by the CNA (records can list several)",
+    product: "First affected product listed by the CNA",
+    affected_count: "How many affected products the CNA lists",
+    versions_stored: "How many different versions of this record we have stored so far",
+    record_hash: "Fingerprint of the chosen version; CVSS scores are joined on it (silver.cve_metrics)",
+    batch_id: "Which download brought this version (joins to ops.ingest_manifest)",
+    observed_at: "When we first had the file that contained this version (UTC)"
+  },
+  assertions: {
+    uniqueKey: ["cve_id"],
+    nonNull: ["cve_id", "state", "date_published", "record_hash", "observed_at"],
+    rowConditions: [
+      "state IN ('PUBLISHED', 'REJECTED')",
+      `date_published >= TIMESTAMP('${dataform.projectConfig.vars.cohort_start}')`
+    ]
+  }
+}
+
+WITH versions AS (
+  SELECT
+    cve_id, state, date_published, date_updated, record_hash, record, batch_id, observed_at,
+    COUNT(*) OVER (PARTITION BY cve_id) AS versions_stored
+  FROM ${ref("cvelist_records")}
+  WHERE date_published >= TIMESTAMP('${dataform.projectConfig.vars.cohort_start}')
+  -- latest version: newest source change first; a record without dateUpdated uses its publish
+  -- date; ties go to the newest observation, then to the hash so the choice is always the same
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY cve_id
+    ORDER BY COALESCE(date_updated, date_published) DESC, observed_at DESC, record_hash DESC) = 1
+)
+
+SELECT
+  cve_id,
+  state,
+  date_published,
+  date_updated,
+  SAFE.TIMESTAMP(JSON_VALUE(record, '$.cveMetadata.dateRejected')) AS date_rejected,
+  JSON_VALUE(record, '$.cveMetadata.assignerShortName') AS assigner,
+  JSON_VALUE(record, '$.containers.cna.title') AS title,
+  ARRAY(
+    SELECT JSON_VALUE(d, '$.value')
+    FROM UNNEST(JSON_QUERY_ARRAY(record, '$.containers.cna.descriptions')) AS d WITH OFFSET AS pos
+    WHERE STARTS_WITH(LOWER(JSON_VALUE(d, '$.lang')), 'en')
+    ORDER BY pos
+  )[SAFE_OFFSET(0)] AS description,
+  JSON_VALUE(record, '$.containers.cna.affected[0].vendor') AS vendor,
+  JSON_VALUE(record, '$.containers.cna.affected[0].product') AS product,
+  ARRAY_LENGTH(JSON_QUERY_ARRAY(record, '$.containers.cna.affected')) AS affected_count,
+  versions_stored,
+  record_hash,
+  batch_id,
+  observed_at
+FROM versions

@@ -2,6 +2,7 @@
 ["cvelist_records", "nvd_records", "kev_records", "kev_snapshots", "epss_scores_v2"].forEach((name) =>
   declare({ schema: "bronze", name })
 );
-["ingest_manifest", "ingest_runs", "source_watermarks"].forEach((name) =>
+// epss_day_status is a view the extractor creates: the single definition of a complete EPSS day.
+["ingest_manifest", "ingest_runs", "source_watermarks", "epss_day_status"].forEach((name) =>
   declare({ schema: "ops", name })
 );

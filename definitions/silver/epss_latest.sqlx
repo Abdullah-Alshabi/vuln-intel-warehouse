@@ -1,0 +1,34 @@
+config {
+  type: "view",
+  schema: "silver",
+  description: "EPSS scores of the latest complete day only, one row per CVE that FIRST scored that day. Complete is decided by ops.epss_day_status, the same definition the extractor uses. A CVE with no score that day gets no row here (NULL in gold), never 0 and never an older score.",
+  columns: {
+    cve_id: "CVE identifier",
+    epss: "Probability (0 to 1) that the CVE is exploited in the next 30 days, from FIRST's EPSS model",
+    epss_percentile: "Share of all scored CVEs with a lower or equal EPSS (0 to 1)",
+    epss_score_date: "The day the scores are for (the latest complete day)",
+    epss_model_version: "EPSS model that produced the score, e.g. v2026.06.15",
+    batch_id: "The EPSS file the score comes from"
+  },
+  assertions: {
+    uniqueKey: ["cve_id"],
+    nonNull: ["cve_id", "epss", "epss_percentile", "epss_score_date", "epss_model_version"],
+    rowConditions: ["epss BETWEEN 0 AND 1", "epss_percentile BETWEEN 0 AND 1"]
+  }
+}
+
+WITH latest_complete_day AS (
+  SELECT MAX(score_date) AS score_date
+  FROM ${ref("epss_day_status")}
+  WHERE complete
+)
+
+SELECT
+  e.cve_id,
+  e.epss,
+  e.percentile AS epss_percentile,
+  e.score_date AS epss_score_date,
+  e.model_version AS epss_model_version,
+  e.batch_id
+FROM ${ref("epss_scores_v2")} e
+JOIN latest_complete_day d USING (score_date)

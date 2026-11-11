@@ -1,0 +1,30 @@
+config {
+  type: "view",
+  schema: "silver",
+  description: "The latest stored NVD record for each CVE, one row per CVE. Gives NIST's analysis status. A CVE missing here is not yet in NVD (or not yet pulled).",
+  columns: {
+    cve_id: "CVE identifier",
+    nvd_status: "NVD analysis status: Received, Awaiting Analysis, Undergoing Analysis, Analyzed, Modified, Deferred (shown as 'Not Scheduled' on the NVD website), Rejected",
+    nvd_published: "When NVD published its record (UTC). Can differ from CVE.org's date by minutes",
+    nvd_last_modified: "When NVD last changed its record (UTC); used to pick the latest version",
+    record_hash: "Fingerprint of the chosen NVD version; NVD's CVSS scores are joined on it",
+    batch_id: "Which NVD page download brought this version",
+    observed_at: "When we first had the file that contained this version (UTC)"
+  },
+  assertions: {
+    uniqueKey: ["cve_id"],
+    nonNull: ["cve_id", "nvd_status", "record_hash"]
+  }
+}
+
+SELECT
+  cve_id,
+  vuln_status AS nvd_status,
+  published AS nvd_published,
+  last_modified AS nvd_last_modified,
+  record_hash,
+  batch_id,
+  observed_at
+FROM ${ref("nvd_records")}
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY cve_id ORDER BY last_modified DESC, observed_at DESC, record_hash DESC) = 1
