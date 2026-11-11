@@ -60,3 +60,8 @@ q "SILVER cvss_selected: the one score chosen by the rule" "
 SELECT cvss_score, cvss_version, cvss_severity, cvss_provider, cvss_provider_role, cvss_via, cvss_is_fallback,
   selection_reason
 FROM \`$P.silver.cvss_selected\` WHERE cve_id = @cve"
+
+q "GOLD cve_current: the published row" "
+SELECT priority, priority_reason, cvss_score, cvss_version, cvss_provider, ROUND(epss_score * 100, 2) epss_pct,
+  epss_score_date, is_kev, kev_date_added, nvd_status, missing_data, updated_at
+FROM \`$P.gold.cve_current\` WHERE cve_id = @cve"

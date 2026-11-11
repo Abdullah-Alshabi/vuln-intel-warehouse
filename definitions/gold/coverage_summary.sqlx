@@ -1,0 +1,36 @@
+config {
+  type: "view",
+  schema: "gold",
+  description: "One-row summary of the PUBLISHED result (gold.cve_current only), so the numbers always match what the dashboard shows.",
+  columns: {
+    cves_in_scope: "Published CVEs in the result",
+    in_kev: "CVEs in the latest valid CISA KEV catalog",
+    p1: "CVEs with priority P1 (in KEV)",
+    p2: "CVEs with priority P2 (EPSS >= 10%, not in KEV)",
+    p3: "CVEs with priority P3 (CVSS >= 9.0, not P1/P2)",
+    other: "CVEs with priority Other (not assessed as safe)",
+    pct_without_cvss: "Percentage of CVEs with no valid CVSS score in the data we hold",
+    pct_without_epss: "Percentage of CVEs with no EPSS score in the chosen EPSS file",
+    pct_not_in_nvd: "Percentage of CVEs with no record in the NVD data we loaded",
+    pct_nvd_deferred: "Percentage of CVEs whose NVD status is Deferred",
+    updated_at: "When the published result was built (UTC)",
+    epss_score_date: "Date of the EPSS file used",
+    kev_catalog_version: "KEV catalog version used"
+  }
+}
+
+SELECT
+  COUNT(*) AS cves_in_scope,
+  COUNTIF(is_kev) AS in_kev,
+  COUNTIF(priority = 'P1') AS p1,
+  COUNTIF(priority = 'P2') AS p2,
+  COUNTIF(priority = 'P3') AS p3,
+  COUNTIF(priority = 'Other') AS other,
+  ROUND(100 * COUNTIF(cvss_score IS NULL) / COUNT(*), 1) AS pct_without_cvss,
+  ROUND(100 * COUNTIF(epss_score IS NULL) / COUNT(*), 1) AS pct_without_epss,
+  ROUND(100 * COUNTIF(nvd_status IS NULL) / COUNT(*), 1) AS pct_not_in_nvd,
+  ROUND(100 * COUNTIF(nvd_status = 'Deferred') / COUNT(*), 1) AS pct_nvd_deferred,
+  MAX(updated_at) AS updated_at,
+  MAX(epss_score_date) AS epss_score_date,
+  MAX(kev_catalog_version) AS kev_catalog_version
+FROM ${ref("cve_current")}

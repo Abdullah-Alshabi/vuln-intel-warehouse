@@ -1,0 +1,50 @@
+config {
+  type: "table",
+  schema: "gold",
+  description: "PUBLISHED result shown on the dashboard: one row per published CVE in scope (CVE.org publish date on or after the cohort start), with the latest information our pipeline collected successfully and a general review priority. Refreshed only when every check on the candidate passes; if a check fails this table is not rebuilt and keeps the last good result. 'Current' means the latest our system collected, not a guarantee of matching the sources at every moment.",
+  // Publishing gate: runs only after the candidate's own assertions (dependOnDependencyAssertions)
+  // and the two custom assertions below have passed.
+  dependOnDependencyAssertions: true,
+  dependencies: ["assert_sources_ready", "assert_candidate_matches_scope"],
+  bigquery: { clusterBy: ["priority", "cve_id"] },
+  columns: {
+    cve_id: "CVE identifier, e.g. CVE-2026-12345",
+    title: "Short title written by the CNA (NULL if none)",
+    description: "English description written by the CNA (NULL if none)",
+    published_at: "When CVE.org published the CVE (UTC)",
+    assigner: "Short name of the CNA that owns the CVE record",
+    first_listed_vendor: "Vendor of the FIRST affected product listed (not all of them)",
+    first_listed_product: "FIRST affected product listed (not all of them)",
+    cvss_score: "Chosen CVSS base score, 0-10; NULL = no valid score in the data we hold (never 0)",
+    cvss_version: "CVSS version of the chosen score (4.0, 3.1, 3.0, 2.0); versions are not comparable",
+    cvss_severity: "Severity text given by the source with the chosen score; NULL if none",
+    cvss_provider: "Who wrote the chosen score (CNA/ADP name or NVD source)",
+    cvss_provider_role: "CNA, ADP, NVD or non-NVD",
+    cvss_via: "Where we read the score: cvelist (CVE.org) or nvd (NVD API)",
+    cvss_vector: "CVSS vector of the chosen score",
+    cvss_is_fallback: "TRUE if the score is a non-NVD score read via NVD (last option of the rule)",
+    cvss_selection_reason: "Why this CVSS score was chosen (see silver.cvss_selected)",
+    is_kev: "TRUE if the CVE is in the latest valid CISA KEV catalog. FALSE does not prove it is not exploited",
+    kev_date_added: "When CISA added the CVE to KEV; NULL when not in KEV",
+    kev_ransomware_use: "CISA's knownRansomwareCampaignUse: Known or Unknown; NULL when not in KEV",
+    epss_score: "EPSS probability (0-1) of exploitation in the next 30 days, for epss_score_date; NULL = no score for this CVE in that file (never 0, never an older score). Shown as a percentage",
+    epss_percentile: "Share of all scored CVEs with a lower or equal EPSS (0-1); NULL with epss_score",
+    nvd_status: "NVD's vulnStatus from the latest NVD record we loaded; NULL = no record in the NVD data we loaded",
+    kev_catalog_version: "CISA KEV catalog version used for every row (one catalog per update)",
+    kev_checked_at: "When we last saw that KEV catalog (UTC), same for every row",
+    epss_score_date: "Date of the EPSS file we looked the score up in, same for every row. It does not mean this CVE had a score in it",
+    epss_model_version: "EPSS model version of that file",
+    cve_record_hash: "Fingerprint of the CVE.org record version used (trace to bronze.cvelist_records)",
+    nvd_record_hash: "Fingerprint of the NVD record version used (trace to bronze.nvd_records)",
+    cvss_record_hash: "Fingerprint of the record version the chosen score belongs to",
+    priority: "General review priority (project rule, in order): P1 = in KEV; P2 = EPSS >= 10%; P3 = CVSS >= 9.0; Other = the rest. Not a fix priority for any specific organisation; Other is not 'safe'",
+    priority_reason: "Plain-English reason for the priority, with the values and sources used",
+    missing_data: "What is missing for this CVE (no CVSS; no EPSS; not in NVD data), NULL if nothing is missing",
+    updated_at: "When this published result was built (UTC): the time the statement that built this table started"
+  }
+}
+
+SELECT
+  * EXCEPT (updated_at),
+  CURRENT_TIMESTAMP() AS updated_at
+FROM ${ref("cve_current_candidate")}

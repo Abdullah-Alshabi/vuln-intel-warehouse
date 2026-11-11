@@ -1,0 +1,92 @@
+config {
+  type: "table",
+  schema: "gold",
+  description: "CANDIDATE result: one row per published CVE in scope with its latest information from the four sources and a general review priority. Built and checked first; gold.cve_current copies it only if every check passes. Column meanings are documented on gold.cve_current.",
+  // wait for the checks of every silver table this one reads
+  dependOnDependencyAssertions: true,
+  bigquery: { clusterBy: ["priority", "cve_id"] },
+  assertions: {
+    uniqueKey: ["cve_id"],
+    nonNull: ["cve_id", "published_at", "priority", "priority_reason", "updated_at",
+              "epss_score_date", "kev_catalog_version", "kev_checked_at"],
+    rowConditions: [
+      "priority IN ('P1', 'P2', 'P3', 'Other')",
+      "cvss_score IS NULL OR cvss_score BETWEEN 0 AND 10",
+      "epss_score IS NULL OR epss_score BETWEEN 0 AND 1",
+      "cvss_score IS NULL OR (cvss_version IS NOT NULL AND cvss_provider IS NOT NULL AND cvss_via IS NOT NULL)",
+      "is_kev = (kev_date_added IS NOT NULL)"
+    ]
+  }
+}
+
+WITH cve AS (
+  SELECT * FROM ${ref("cve_latest")} WHERE state = 'PUBLISHED'   -- REJECTED is removed here
+),
+kev_meta AS (      -- one catalog for the whole result
+  SELECT ANY_VALUE(catalog_version) AS kev_catalog_version, MAX(kev_checked_at) AS kev_checked_at
+  FROM ${ref("kev_current")}
+),
+epss_meta AS (     -- one EPSS day for the whole result
+  SELECT MAX(epss_score_date) AS epss_score_date, ANY_VALUE(epss_model_version) AS epss_model_version
+  FROM ${ref("epss_latest")}
+),
+joined AS (        -- LEFT JOINs: a CVE missing from a source keeps its row, with NULLs (never 0)
+  SELECT
+    c.cve_id, c.title, c.description, c.date_published AS published_at, c.assigner,
+    c.first_listed_vendor, c.first_listed_product,
+    s.cvss_score, s.cvss_version, s.cvss_severity, s.cvss_provider, s.cvss_provider_role, s.cvss_via,
+    s.cvss_vector, s.cvss_is_fallback, s.selection_reason AS cvss_selection_reason,
+    k.cve_id IS NOT NULL AS is_kev, k.date_added AS kev_date_added, k.ransomware_use AS kev_ransomware_use,
+    e.epss AS epss_score, e.epss_percentile,
+    n.nvd_status,
+    km.kev_catalog_version, km.kev_checked_at, em.epss_score_date, em.epss_model_version,
+    c.record_hash AS cve_record_hash, n.record_hash AS nvd_record_hash, s.record_hash AS cvss_record_hash
+  FROM cve c
+  LEFT JOIN ${ref("nvd_latest")} n ON n.cve_id = c.cve_id
+  LEFT JOIN ${ref("cvss_selected")} s ON s.cve_id = c.cve_id
+  LEFT JOIN ${ref("kev_current")} k ON k.cve_id = c.cve_id
+  LEFT JOIN ${ref("epss_latest")} e ON e.cve_id = c.cve_id
+  CROSS JOIN kev_meta km
+  CROSS JOIN epss_meta em
+),
+texts AS (
+  SELECT
+    *,
+    -- FORMAT turns NULL into the text 'NULL', so a missing value must stay NULL explicitly
+    IF(epss_score IS NULL, NULL,
+       CONCAT(IF(epss_score * 100 < 1, FORMAT('%.2f', epss_score * 100), FORMAT('%.1f', epss_score * 100)), '%'))
+      AS epss_txt,
+    IF(cvss_score IS NULL, NULL,
+       FORMAT('CVSS %.1f (v%s, %s %s)', cvss_score, cvss_version, cvss_provider_role, cvss_provider)) AS cvss_txt
+  FROM joined
+)
+
+SELECT
+  * EXCEPT (epss_txt, cvss_txt),
+  -- general review priority (project rule, in order; NULL never counts as a low value)
+  CASE
+    WHEN is_kev THEN 'P1'
+    WHEN epss_score >= 0.10 THEN 'P2'
+    WHEN cvss_score >= 9.0 THEN 'P3'
+    ELSE 'Other'
+  END AS priority,
+  CASE
+    WHEN is_kev THEN
+      CONCAT('In CISA KEV (added ', CAST(kev_date_added AS STRING), ')')
+    WHEN epss_score >= 0.10 THEN
+      CONCAT('Not in KEV; EPSS ', epss_txt, ' is at or above the project threshold of 10%')
+    WHEN cvss_score >= 9.0 THEN
+      CONCAT('Not in KEV; ', IFNULL(CONCAT('EPSS ', epss_txt, ' is below 10%'), 'EPSS unavailable'),
+             '; ', cvss_txt, ' is at or above 9.0')
+    ELSE
+      CONCAT('Not in KEV; ',
+             IFNULL(CONCAT(cvss_txt, ' is below 9.0'), 'CVSS unavailable'), '; ',
+             IFNULL(CONCAT('EPSS ', epss_txt, ' is below 10%'), 'EPSS unavailable'),
+             IF(cvss_score IS NULL AND epss_score IS NULL, '. Not assessed as safe.', ''))
+  END AS priority_reason,
+  NULLIF(ARRAY_TO_STRING([
+    IF(cvss_score IS NULL, 'no CVSS', NULL),
+    IF(epss_score IS NULL, 'no EPSS', NULL),
+    IF(nvd_status IS NULL, 'not in NVD data', NULL)], '; '), '') AS missing_data,
+  CURRENT_TIMESTAMP() AS updated_at
+FROM texts
