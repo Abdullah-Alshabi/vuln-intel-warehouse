@@ -1,7 +1,7 @@
 config {
   type: "table",
   schema: "silver",
-  description: "One CVSS score per CVE, chosen by the project's documented rule from the scores of the CHOSEN record versions only (cve_latest and nvd_latest). Rule: version 4.0, then 3.1, 3.0, 2.0; within a version: CNA via cvelist, CISA-ADP via cvelist, NVD-authored, another ADP via cvelist, then a non-NVD score via NVD (fallback); then the GENERAL scenario (an unspecified scenario counts as GENERAL); then the highest base score among equally ranked candidates. This is a project policy, not proof that one provider or version is more accurate. A CVE with no valid score has no row here (NULL in gold, never 0).",
+  description: "One CVSS score per CVE in scope (cve_latest), chosen by the project's documented rule from the scores of the CHOSEN record versions only (cve_latest and nvd_latest). Rule: version 4.0, then 3.1, 3.0, 2.0; within a version: CNA via cvelist, CISA-ADP via cvelist, NVD-authored, another ADP via cvelist, then a non-NVD score via NVD (fallback); then the GENERAL scenario (an unspecified scenario counts as GENERAL); then the highest base score among equally ranked candidates. This is a project policy, not proof that one provider or version is more accurate. A CVE with no valid score has no row here (NULL in gold, never 0).",
   bigquery: { clusterBy: ["cve_id"] },
   columns: {
     cve_id: "CVE identifier",
@@ -35,6 +35,9 @@ WITH chosen_metrics AS (   -- scores of the chosen versions only: joined on cve_
   FROM ${ref("cve_metrics")} m
   JOIN ${ref("nvd_latest")} n
     ON m.ingestion_source = 'nvd' AND m.cve_id = n.cve_id AND m.record_hash = n.record_hash
+  -- NVD also holds CVEs outside our scope (2-day margin, rejected before publication);
+  -- only CVEs that exist in cve_latest (our scope) get a score here
+  WHERE m.cve_id IN (SELECT cve_id FROM ${ref("cve_latest")})
 ),
 
 ranked AS (
