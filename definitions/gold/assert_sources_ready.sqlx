@@ -1,0 +1,29 @@
+config {
+  type: "assertion",
+  description: "Blocks publishing unless every source is present and fresh. Returns one row per problem (a NULL or missing value is a problem, not a pass). Limits (project policy): KEV and NVD checked within 30 hours, cvelist within 3 hours, EPSS score_date at most 2 calendar days before today."
+}
+
+WITH kev AS (SELECT COUNT(*) AS n, MAX(kev_checked_at) AS checked FROM ${ref("kev_current")}),
+epss AS (SELECT COUNT(*) AS n, MAX(epss_score_date) AS d FROM ${ref("epss_latest")}),
+checks AS (
+  SELECT source, last_checked_at FROM ${ref("source_watermarks")}
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY source ORDER BY recorded_at DESC) = 1
+),
+nvd AS (SELECT MAX(IF(source = 'nvd', last_checked_at, NULL)) AS checked FROM checks),
+cvelist AS (SELECT MAX(IF(source = 'cvelist', last_checked_at, NULL)) AS checked FROM checks)
+
+SELECT 'KEV: no valid catalog (silver.kev_current is empty)' AS problem FROM kev WHERE n = 0
+UNION ALL
+SELECT 'KEV: last sighting unknown or older than 30 hours' FROM kev
+WHERE checked IS NULL OR checked < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 HOUR)
+UNION ALL
+SELECT 'EPSS: no complete day (silver.epss_latest is empty)' FROM epss WHERE n = 0
+UNION ALL
+SELECT 'EPSS: score_date unknown or more than 2 days before today' FROM epss
+WHERE d IS NULL OR DATE_DIFF(CURRENT_DATE(), d, DAY) > 2
+UNION ALL
+SELECT 'NVD: last successful check unknown or older than 30 hours' FROM nvd
+WHERE checked IS NULL OR checked < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 HOUR)
+UNION ALL
+SELECT 'cvelist: last successful check unknown or older than 3 hours' FROM cvelist
+WHERE checked IS NULL OR checked < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR)
