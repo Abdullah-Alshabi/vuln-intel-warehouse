@@ -3,7 +3,11 @@ config {
   description: "Blocks publishing unless the candidate has exactly one row for every PUBLISHED CVE in silver.cve_latest and nothing else: no CVE lost or added by the joins, no duplicate, no REJECTED CVE, and not empty. Returns one row per problem."
 }
 
-WITH published AS (SELECT cve_id FROM ${ref("cve_latest")} WHERE state = 'PUBLISHED'),
+-- resolve() (not ref()): reads silver.cve_latest WITHOUT adding a dependency. With ref(), Dataform counts this
+-- assertion as a check "of cve_latest", so the candidate (dependOnDependencyAssertions) would wait for it while
+-- it waits for the candidate: a circular dependency. The order stays correct: the candidate depends on
+-- cve_latest, and this assertion depends on the candidate.
+WITH published AS (SELECT cve_id FROM ${resolve("cve_latest")} WHERE state = 'PUBLISHED'),
 candidate AS (SELECT cve_id FROM ${ref("cve_current_candidate")})
 
 SELECT 'published CVE missing from the candidate' AS problem, cve_id FROM published
