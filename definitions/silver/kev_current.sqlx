@@ -1,12 +1,12 @@
 config {
   type: "view",
   schema: "silver",
-  description: "Members of the latest valid CISA KEV catalog: one row per CVE in it. Valid = we loaded that catalog completely (status 'loaded', never 'partial'); a later 'unchanged' observation of the same catalog counts as a new sighting of it. A CVE removed by CISA disappears from here. Not being in KEV does not prove a CVE is not exploited.",
+  description: "Members of the latest valid CISA KEV catalog: one row per CVE in it. Valid = loaded with status 'loaded' (never 'partial') AND the stored membership has exactly as many CVEs as CISA's own count for that catalog. A later 'unchanged' observation of the same catalog counts as a new sighting of it. A CVE removed by CISA disappears from here. Not being in KEV does not prove a CVE is not exploited. If no catalog is valid this view is empty; gold treats that as a blocking problem, not as 'no CVE is in KEV'.",
   columns: {
     cve_id: "CVE identifier",
     catalog_version: "CISA's version of the catalog the membership comes from (e.g. 2026.11.06)",
     kev_checked_at: "When we last saw this catalog (UTC): its latest 'loaded' or 'unchanged' sighting",
-    date_added: "When CISA added the CVE to KEV",
+    date_added: "When CISA added the CVE to KEV (never NULL: a NULL would mean an entry lost in the join, and fails the assertion)",
     ransomware_use: "CISA's knownRansomwareCampaignUse: Known or Unknown (Unknown is not 'no')",
     record_hash: "Fingerprint of the KEV entry (joins to bronze.kev_records)",
     batch_id: "The catalog download the membership comes from"
@@ -18,18 +18,22 @@ config {
   }
 }
 
-WITH valid_catalogs AS (   -- catalogs loaded completely, whose full membership we stored
-  SELECT DISTINCT m.batch_id
+WITH members_stored AS (    -- how many members we stored for each catalog download
+  SELECT batch_id, COUNT(DISTINCT cve_id) AS n FROM ${ref("kev_snapshots")} GROUP BY 1
+),
+valid_catalogs AS (         -- loaded (not partial) AND stored membership = CISA's count
+  SELECT m.batch_id
   FROM ${ref("ingest_manifest")} m
-  WHERE m.source = 'kev' AND m.status = 'loaded'
-    AND m.batch_id IN (SELECT DISTINCT batch_id FROM ${ref("kev_snapshots")})
+  JOIN members_stored s USING (batch_id)
+  WHERE m.source = 'kev' AND m.status = 'loaded' AND s.n = m.records_seen
+  GROUP BY 1
 ),
 latest_sighting AS (       -- the newest sighting of a valid catalog ('loaded' or 'unchanged')
   SELECT m.batch_id, m.finished_at AS kev_checked_at
   FROM ${ref("ingest_manifest")} m
   WHERE m.source = 'kev' AND m.status IN ('loaded', 'unchanged')
     AND m.batch_id IN (SELECT batch_id FROM valid_catalogs)
-  QUALIFY ROW_NUMBER() OVER (ORDER BY m.finished_at DESC) = 1
+  QUALIFY ROW_NUMBER() OVER (ORDER BY m.finished_at DESC, m.batch_id DESC) = 1
 )
 
 SELECT
@@ -42,7 +46,7 @@ SELECT
   s.batch_id
 FROM latest_sighting l
 JOIN ${ref("kev_snapshots")} s USING (batch_id)
-JOIN (SELECT cve_id, record_hash, ANY_VALUE(date_added) AS date_added,
+LEFT JOIN (SELECT cve_id, record_hash, ANY_VALUE(date_added) AS date_added,  -- LEFT: a lost entry shows as NULL
              ANY_VALUE(known_ransomware_campaign_use) AS known_ransomware_campaign_use
       FROM ${ref("kev_records")} GROUP BY 1, 2) r
   ON r.cve_id = s.cve_id AND r.record_hash = s.record_hash

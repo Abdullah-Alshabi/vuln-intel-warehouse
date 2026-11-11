@@ -2,8 +2,10 @@
 # =============================================================================
 # Compile and run the Dataform workflow from any Git branch, before merging it.
 # Runs as dataform-sa (same identity as production). Cloud Shell:
+# NOT an isolated environment: the branch changes the CODE that runs, but it writes to the
+# same silver/gold/ops datasets. Run it when the daily job is not running (09:20 Riyadh).
 #   bash infra/dataform_run.sh <branch> [tag]      e.g.  bash infra/dataform_run.sh step2/silver
-# With a tag, only actions with that tag run; without, every action runs.
+# With a tag, only actions with that tag run (only useful once actions have tags); without, all run.
 # Prints compilation errors, then each action's final state.
 # =============================================================================
 set -euo pipefail

@@ -1,7 +1,7 @@
 config {
   type: "table",
   schema: "silver",
-  description: "The latest stored version of each CVE record from CVE.org (cvelistV5), one row per CVE in scope. Latest = newest dateUpdated, then the newest observation. Rejected CVEs are kept here (state = REJECTED) and removed in gold.",
+  description: "The latest stored version of each CVE record from CVE.org (cvelistV5), one row per CVE in scope. Latest = newest dateUpdated, then the newest observation; the scope (publish date on or after the cohort start) is applied to the chosen version. Rejected CVEs are kept here (state = REJECTED) and removed in gold.",
   bigquery: { clusterBy: ["cve_id"] },
   columns: {
     cve_id: "CVE identifier, e.g. CVE-2026-12345",
@@ -12,10 +12,10 @@ config {
     assigner: "Short name of the CNA that owns the record (e.g. microsoft, VulnCheck)",
     title: "Short title written by the CNA; NULL when the CNA gave none",
     description: "English description written by the CNA; NULL when there is no English description",
-    vendor: "Vendor of the first affected product listed by the CNA (records can list several)",
-    product: "First affected product listed by the CNA",
+    first_listed_vendor: "Vendor of the FIRST affected product the CNA lists (records can list several; this is not all of them)",
+    first_listed_product: "The FIRST affected product the CNA lists (see affected_count for how many there are)",
     affected_count: "How many affected products the CNA lists",
-    versions_stored: "How many different versions of this record we have stored so far",
+    versions_stored: "How many different versions of this record WE have stored (not every version the source ever had)",
     record_hash: "Fingerprint of the chosen version; CVSS scores are joined on it (silver.cve_metrics)",
     batch_id: "Which download brought this version (joins to ops.ingest_manifest)",
     observed_at: "When we first had the file that contained this version (UTC)"
@@ -35,7 +35,6 @@ WITH versions AS (
     cve_id, state, date_published, date_updated, record_hash, record, batch_id, observed_at,
     COUNT(*) OVER (PARTITION BY cve_id) AS versions_stored
   FROM ${ref("cvelist_records")}
-  WHERE date_published >= TIMESTAMP('${dataform.projectConfig.vars.cohort_start}')
   -- latest version: newest source change first; a record without dateUpdated uses its publish
   -- date; ties go to the newest observation, then to the hash so the choice is always the same
   QUALIFY ROW_NUMBER() OVER (
@@ -57,11 +56,14 @@ SELECT
     WHERE STARTS_WITH(LOWER(JSON_VALUE(d, '$.lang')), 'en')
     ORDER BY pos
   )[SAFE_OFFSET(0)] AS description,
-  JSON_VALUE(record, '$.containers.cna.affected[0].vendor') AS vendor,
-  JSON_VALUE(record, '$.containers.cna.affected[0].product') AS product,
+  JSON_VALUE(record, '$.containers.cna.affected[0].vendor') AS first_listed_vendor,
+  JSON_VALUE(record, '$.containers.cna.affected[0].product') AS first_listed_product,
   ARRAY_LENGTH(JSON_QUERY_ARRAY(record, '$.containers.cna.affected')) AS affected_count,
   versions_stored,
   record_hash,
   batch_id,
   observed_at
 FROM versions
+-- scope is applied AFTER choosing the latest version: if the source corrected the publish date,
+-- the corrected (latest) version decides, never an older one
+WHERE date_published >= TIMESTAMP('${dataform.projectConfig.vars.cohort_start}')

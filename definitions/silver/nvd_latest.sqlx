@@ -1,11 +1,11 @@
 config {
   type: "view",
   schema: "silver",
-  description: "The latest stored NVD record for each CVE, one row per CVE. Gives NIST's analysis status. A CVE missing here is not yet in NVD (or not yet pulled).",
+  description: "The latest stored NVD record for each CVE, one row per CVE. Gives NIST's analysis status. A CVE missing here has no record in the NVD data we loaded.",
   columns: {
     cve_id: "CVE identifier",
-    nvd_status: "NVD analysis status: Received, Awaiting Analysis, Undergoing Analysis, Analyzed, Modified, Deferred (shown as 'Not Scheduled' on the NVD website), Rejected",
-    nvd_published: "When NVD published its record (UTC). Can differ from CVE.org's date by minutes",
+    nvd_status: "NVD's vulnStatus value as returned by the NVD API (e.g. Received, Awaiting Analysis, Analyzed, Deferred)",
+    nvd_published: "When NVD published its record (UTC). Can differ from CVE.org's publish date",
     nvd_last_modified: "When NVD last changed its record (UTC); used to pick the latest version",
     record_hash: "Fingerprint of the chosen NVD version; NVD's CVSS scores are joined on it",
     batch_id: "Which NVD page download brought this version",
