@@ -17,14 +17,16 @@ config {
   }
 }
 
+-- Dates from the stored source JSON (fractions of a second kept; NVD times are UTC without a zone);
+-- the typed column is the fallback for older rows typed with whole seconds only
 SELECT
   cve_id,
   vuln_status AS nvd_status,
-  published AS nvd_published,
-  last_modified AS nvd_last_modified,
+  COALESCE(SAFE.TIMESTAMP(JSON_VALUE(record, '$.published')), published) AS nvd_published,
+  COALESCE(SAFE.TIMESTAMP(JSON_VALUE(record, '$.lastModified')), last_modified) AS nvd_last_modified,
   record_hash,
   batch_id,
   observed_at
 FROM ${ref("nvd_records")}
 QUALIFY ROW_NUMBER() OVER (
-  PARTITION BY cve_id ORDER BY last_modified DESC, observed_at DESC, record_hash DESC) = 1
+  PARTITION BY cve_id ORDER BY nvd_last_modified DESC, observed_at DESC, record_hash DESC) = 1

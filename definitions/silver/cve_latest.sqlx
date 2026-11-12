@@ -30,11 +30,19 @@ config {
   }
 }
 
-WITH versions AS (
+WITH precise AS (
+  -- Dates are read from the stored source JSON, which keeps fractions of a second (older bronze
+  -- rows were typed with whole seconds only). The typed column is the fallback.
+  SELECT * REPLACE (
+    COALESCE(SAFE.TIMESTAMP(JSON_VALUE(record, '$.cveMetadata.datePublished')), date_published) AS date_published,
+    COALESCE(SAFE.TIMESTAMP(JSON_VALUE(record, '$.cveMetadata.dateUpdated')), date_updated) AS date_updated)
+  FROM ${ref("cvelist_records")}
+),
+versions AS (
   SELECT
     cve_id, state, date_published, date_updated, record_hash, record, batch_id, observed_at,
     COUNT(*) OVER (PARTITION BY cve_id) AS versions_stored
-  FROM ${ref("cvelist_records")}
+  FROM precise
   -- latest version: newest source change first; a record without dateUpdated uses its publish
   -- date; ties go to the newest observation, then to the hash so the choice is always the same
   QUALIFY ROW_NUMBER() OVER (

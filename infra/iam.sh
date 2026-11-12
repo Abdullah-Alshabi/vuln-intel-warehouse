@@ -45,7 +45,7 @@ grant_project() {  # account, role
 }
 grant_project extractor-sa roles/bigquery.jobUser
 grant_project extractor-sa roles/dataform.editor
-grant_project dataform-sa  roles/bigquery.dataEditor
+# dataform-sa gets NO project-wide dataEditor: its dataset-level roles are set by infra/dataform_iam.sh
 grant_project dataform-sa  roles/bigquery.jobUser
 grant_project build-sa     roles/logging.logWriter
 

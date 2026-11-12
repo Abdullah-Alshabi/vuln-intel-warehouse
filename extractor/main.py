@@ -111,7 +111,8 @@ def now():
 
 
 def iso(t):
-    return t.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    # keeps fractions of a second when the source has them (a value with none prints none)
+    return t.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def sha256(b):
@@ -237,19 +238,22 @@ def ensure_tables():
 
 def epss_day_status_sql():
     """One row per EPSS score_date. complete = a successful load into the table, no conflict,
-    and the table holds exactly the rows the manifest says were loaded (and more than 0).
+    and the table holds exactly as many rows as the file has (and more than 0).
+    file_rows is the file's row count (records_in_scope), not the rows inserted by that load:
+    after a load without conflicts every key of the file is in the table with the same values,
+    so equal counts mean an exact match, even when a retry inserted nothing new.
     The extractor's gap fill and Dataform's epss_latest both read this view: one definition."""
     return f"""
     WITH m AS (
       SELECT SAFE.PARSE_DATE('%Y-%m-%d', SPLIT(batch_id, ':')[SAFE_OFFSET(1)]) AS score_date,
         COUNTIF(status = 'loaded') AS ok_loads, COUNTIF(status = 'conflicts') AS conflict_rows,
-        SUM(IF(status = 'loaded', records_new, 0)) AS loaded_rows
+        MAX(IF(status = 'loaded', records_in_scope, NULL)) AS file_rows
       FROM `{MANIFEST}` WHERE target = '{T_EPSS}' GROUP BY 1),
     t AS (SELECT score_date, COUNT(*) AS table_rows FROM `{T_EPSS}` GROUP BY 1)
     SELECT score_date, IFNULL(ok_loads, 0) AS ok_loads, IFNULL(conflict_rows, 0) AS conflict_rows,
-      IFNULL(loaded_rows, 0) AS loaded_rows, IFNULL(table_rows, 0) AS table_rows,
+      IFNULL(file_rows, 0) AS file_rows, IFNULL(table_rows, 0) AS table_rows,
       (IFNULL(ok_loads, 0) > 0 AND IFNULL(conflict_rows, 0) = 0
-       AND IFNULL(table_rows, 0) > 0 AND table_rows = loaded_rows) AS complete
+       AND IFNULL(table_rows, 0) > 0 AND table_rows = file_rows) AS complete
     FROM m FULL OUTER JOIN t USING (score_date)
     WHERE score_date IS NOT NULL"""
 
@@ -426,8 +430,12 @@ class Lock:
 
 
 # ------------------------------------------------------------------ cvelistV5
-def cve_row(name, raw, batch_id, file_uri, observed_at, processed_at):
-    """Return (row | None, problem | None) for one CVE JSON file. Out of scope -> (None, None)."""
+def cve_row(name, raw, batch_id, file_uri, observed_at, processed_at, known=frozenset()):
+    """Return (row | None, problem | None) for one CVE JSON file. Out of scope -> (None, None).
+    known: CVE ids already stored. A NEW CVE is admitted only if published on or after the cohort
+    start. An update of a KNOWN CVE is always admitted (even if its publish date was corrected to
+    before the cohort, or it was rejected without a publish date), so the latest version reaches
+    silver, which decides membership from that latest version."""
     m = CVE_FILE.search(name)
     try:
         rec = json.loads(raw)
@@ -445,29 +453,33 @@ def cve_row(name, raw, batch_id, file_uri, observed_at, processed_at):
         updated = parse_ts(meta.get("dateUpdated"))
     except (TypeError, ValueError) as e:
         return None, f"{name}: bad date ({e})"
-    if published is None or published < COHORT_START_TS:
-        # Out of scope, not a problem. A CVE rejected before it was ever published has no
-        # datePublished and never belongs to the cohort; one published in scope and rejected
-        # later keeps its datePublished and stays, so the rejection is recorded.
-        return None, None
+    if meta["cveId"] not in known and (published is None or published < COHORT_START_TS):
+        return None, None  # a new CVE outside the cohort: out of scope, not a problem
     return {
         "cve_id": meta["cveId"], "state": meta.get("state"), "data_version": rec.get("dataVersion"),
-        "date_published": iso(published), "date_updated": iso(updated) if updated else None,
+        "date_published": iso(published) if published else None,
+        "date_updated": iso(updated) if updated else None,
         "record_hash": canonical_hash(rec), "record": rec,
         "run_id": RUN_ID, "batch_id": batch_id, "file_uri": file_uri,
         "observed_at": iso(observed_at), "processed_at": iso(processed_at),
     }, None
 
 
-def cve_rows_from_zip(zf, batch_id, file_uri, observed_at, processed_at):
+def cve_rows_from_zip(zf, batch_id, file_uri, observed_at, processed_at, known=frozenset()):
     """Yield (row | None, problem | None) for every CVE JSON member."""
     for info_ in zf.infolist():
         if CVE_FILE.search(info_.filename):
-            yield cve_row(info_.filename, zf.read(info_), batch_id, file_uri, observed_at, processed_at)
+            yield cve_row(info_.filename, zf.read(info_), batch_id, file_uri, observed_at, processed_at, known)
+
+
+def known_cve_ids():
+    """CVE ids already stored in bronze (about 20-30 thousand ids, one small query)."""
+    return frozenset(r.cve_id for r in bq.query(f"SELECT DISTINCT cve_id FROM `{T_CVELIST}`").result())
 
 
 def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, started, acquired):
     processed = now()
+    known = known_cve_ids()
     rows, problems, seen = [], [], 0
 
     def take(pairs):
@@ -488,9 +500,9 @@ def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, sta
                         tmp.write(chunk)
                 tmp.flush()
                 with zipfile.ZipFile(tmp.name) as inner:
-                    take(cve_rows_from_zip(inner, batch_id, file_uri, acquired, processed))
+                    take(cve_rows_from_zip(inner, batch_id, file_uri, acquired, processed, known))
         else:  # hourly delta: CVE files directly
-            take(cve_rows_from_zip(outer, batch_id, file_uri, acquired, processed))
+            take(cve_rows_from_zip(outer, batch_id, file_uri, acquired, processed, known))
     common = dict(source=source, batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=size,
                   records_seen=seen, records_failed=len(problems), target=T_CVELIST,
                   acquired_at=iso(acquired), started_at=iso(started))
@@ -504,6 +516,9 @@ def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, sta
              status="partial" if problems else "loaded", detail="; ".join(problems[:5]))
     if problems:
         error("cvelist records skipped", count=len(problems), examples=problems[:5])
+        # the good records are stored, but the file is not complete: fail, so run_cvelist does
+        # not record a successful check; gold stays blocked until a later complete baseline
+        raise RuntimeError(f"cvelist file partial: {len(problems)} records skipped, e.g. {problems[:3]}")
     return new
 
 
@@ -537,6 +552,31 @@ def run_cvelist(kind):
 
 
 # ------------------------------------------------------------------ NVD
+def nvd_page_checked(d, idx):
+    """Validate one NVD response page requested at startIndex=idx.
+    Returns (vulnerabilities, total, per_page) or raises ValueError. An empty page is valid only
+    when NVD says there is nothing left (totalResults == idx, e.g. 0 results)."""
+    if not isinstance(d, dict):
+        raise ValueError(f"NVD response is {type(d).__name__}, not an object")
+    vulns = d.get("vulnerabilities")
+    fields = {k: d.get(k) for k in ("totalResults", "resultsPerPage", "startIndex")}
+    if not isinstance(vulns, list):
+        raise ValueError("NVD response has no 'vulnerabilities' list")
+    for k, v in fields.items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ValueError(f"NVD response field {k} is {v!r}")
+    total, per_page, start = fields["totalResults"], fields["resultsPerPage"], fields["startIndex"]
+    if start != idx:
+        raise ValueError(f"NVD startIndex {start}, requested {idx}")
+    if len(vulns) != per_page:
+        raise ValueError(f"NVD page says resultsPerPage {per_page} but holds {len(vulns)}")
+    if idx < total and per_page == 0:
+        raise ValueError(f"NVD page is empty at {idx} of {total}")
+    if idx + per_page > total:
+        raise ValueError(f"NVD page goes past totalResults ({idx}+{per_page} > {total})")
+    return vulns, total, per_page
+
+
 def run_nvd():
     """Incremental by lastModified: fixed window end, short overlap, watermark after full success."""
     started = now()
@@ -555,14 +595,20 @@ def run_nvd():
                  f"&lastModEndDate={chunk_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
                  f"&resultsPerPage=2000&startIndex={idx}")
             body = fetch(f"{NVD_API}?{q}", f"nvd page {page}", headers=headers)
-            d = json.loads(body)
             batch_id = f"nvd:{iso(chunk_start)}..{iso(chunk_end)}:p{page}"
             file_uri, acquired = land(
                 "nvd", f"{chunk_start:%Y%m%dT%H%M%S}_{chunk_end:%Y%m%dT%H%M%S}_p{page:03d}_{sha256(body)[:12]}.json",
                 data=body, content_type="application/json")
             processed = now()
+            try:  # parsed after landing, so even an unreadable page is kept in raw
+                vulns, total, per_page = nvd_page_checked(json.loads(body), idx)
+            except ValueError as e:  # the raw page is kept; nothing is loaded; no watermark
+                manifest(source="nvd", batch_id=batch_id, request=q, file_uri=file_uri, sha256=sha256(body),
+                         bytes=len(body), records_seen=0, records_in_scope=0, records_new=0, status="invalid",
+                         target=T_NVD, detail=str(e), acquired_at=iso(acquired), started_at=iso(started))
+                raise RuntimeError(f"NVD page {page} invalid: {e}") from e
             rows = []
-            for v in d.get("vulnerabilities", []):
+            for v in vulns:
                 c = v.get("cve", {})
                 pub = parse_ts(c.get("published"))
                 if pub is None or pub < COHORT_START_TS - dt.timedelta(days=2):
@@ -575,13 +621,13 @@ def run_nvd():
             new, _ = insert_new_only(T_NVD, rows, ["cve_id", "record_hash"])
             total_new += new
             manifest(source="nvd", batch_id=batch_id, request=q, file_uri=file_uri, sha256=sha256(body),
-                     bytes=len(body), records_seen=len(d.get("vulnerabilities", [])),
+                     bytes=len(body), records_seen=len(vulns),
                      records_in_scope=len(rows), records_new=new, status="loaded", target=T_NVD,
                      acquired_at=iso(acquired), started_at=iso(started))
-            idx += d.get("resultsPerPage", 0)
+            idx += per_page
             page += 1
             time.sleep(pause)
-            if idx >= d.get("totalResults", 0) or d.get("resultsPerPage", 0) == 0:
+            if idx >= total:  # nvd_page_checked guarantees progress while idx < total
                 break
         chunk_start = chunk_end
     watermark_set("nvd", iso(window_end), changed=total_new > 0)  # only after every page succeeded
@@ -663,6 +709,8 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None, expected_dat
     model, score_date, rest = parse_epss(body)
     if expected_date and score_date != expected_date:
         raise RuntimeError(f"EPSS file for {expected_date} has score_date {score_date}")
+    if dt.date.fromisoformat(score_date) > now().date() + dt.timedelta(days=1):
+        raise RuntimeError(f"EPSS file has score_date {score_date}, in the future")
     batch_id = f"epss:{score_date}:{file_sha[:12]}"
     if already_loaded(file_sha, T_EPSS):
         manifest(source="epss", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),

@@ -110,18 +110,52 @@ def put(k, n_rows, loaded, status="loaded"):
              "model_version": "t", "batch_id": f"epss:{day(k)}:test", "observed_at": main.iso(main.now()),
              "processed_at": main.iso(main.now())} for i in range(n_rows)]
     main.insert_new_only(E, rows, ["cve_id", "score_date"])
-    main.manifest(source="epss", batch_id=f"epss:{day(k)}:test", status=status, records_new=loaded, target=E)
+    main.manifest(source="epss", batch_id=f"epss:{day(k)}:test", status=status, records_new=loaded,
+                  records_in_scope=loaded, target=E)
 put(0, 3, 3)                                                     # complete
 main.manifest(source="epss", batch_id=f"epss:{day(1)}", status="failed", target=E)   # failed, never loaded
 put(2, 2, 2)                                                     # complete, AFTER the hole
-put(3, 2, 3)                                                     # table has 2 rows, manifest says 3
+put(3, 2, 3)                                                     # table has 2 rows, the file had 3
 put(4, 2, 2); main.manifest(source="epss", batch_id=f"epss:{day(4)}:test2", status="conflicts", target=E)
+# F4: the INSERT succeeds, then writing the manifest fails; the retry inserts nothing new
+import gzip  # noqa: E402
+f4_body = gzip.compress((f"#model_version:t,score_date:{day(5)}T12:00:00Z\ncve,epss,percentile\n"
+                         + "".join(f"CVE-1999-5{i:04d},0.2,0.6\n" for i in range(3))).encode())
+real_manifest, failed_once = main.manifest, []
+def flaky_manifest(**r):
+    if not failed_once:
+        failed_once.append(1)
+        raise RuntimeError("injected: manifest write failed after the INSERT")
+    real_manifest(**r)
+main.manifest = flaky_manifest
+try:
+    main.ingest_epss(f4_body, "f4 first try", main.now())
+    first = "no error"
+except RuntimeError as e:
+    first = str(e)
+retry_date, retry_new = main.ingest_epss(f4_body, "f4 retry", main.now())
+main.manifest = real_manifest
+f4 = one(f"SELECT complete, file_rows, table_rows FROM `{main.V_EPSS_DAYS}` WHERE score_date = '{day(5)}'")[0]
+check("F4. INSERT ok then manifest failed: the first try fails", "injected" in first, first)
+check("F4. ...the retry inserts 0 new rows and is recorded loaded", retry_new == 0, retry_new)
+check("F4. ...and the day is complete (table rows = the file's rows), not stuck incomplete",
+      f4.complete and f4.file_rows == 3 and f4.table_rows == 3, dict(f4.items()))
+
 saved_start = main.COHORT_START_TS
 main.COHORT_START_TS = dt.datetime(1999, 1, 1, tzinfo=dt.timezone.utc)
-gaps = main.epss_gap_days(day(5))
+gaps = main.epss_gap_days(day(6))
 main.COHORT_START_TS = saved_start
 check("3g. gap days on real BigQuery: a failed day behind a later good day, a row-count mismatch, "
-      "and a conflict day are all reported", gaps == [day(1), day(3), day(4)], str(gaps))
+      "and a conflict day are all reported (and the F4 day is not)", gaps == [day(1), day(3), day(4)], str(gaps))
+
+# ------------------------------------------------------------ F1: known CVE ids come from bronze
+main.load_json_rows(main.T_CVELIST, [{"cve_id": "CVE-1999-0001", "state": "PUBLISHED", "record_hash": "x",
+                                      "date_published": "2026-10-20T10:00:00.5Z", "record": {"a": 1}}])
+known = main.known_cve_ids()
+check("F1. known_cve_ids reads the ids stored in bronze cvelist", "CVE-1999-0001" in known, len(known))
+stored = one(f"SELECT FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', date_published) t FROM `{main.T_CVELIST}` "
+             f"WHERE cve_id = 'CVE-1999-0001'")[0].t
+check("F6. BigQuery keeps the fraction of a second we now send", stored == "2026-10-20T10:00:00.5Z", stored)
 
 # ------------------------------------------------------------ 4. KEV membership per catalog version
 t1 = dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc)
