@@ -304,8 +304,8 @@ with mock.patch.object(main, "bq", types.SimpleNamespace(query=fake_query)):
     gaps = main.epss_gap_days("2026-11-11")
 check("epss_gap_days: expected days come from GENERATE_DATE_ARRAY joined to the shared status view",
       gaps == ["2026-11-09"] and "GENERATE_DATE_ARRAY" in captured["q"] and main.V_EPSS_DAYS in captured["q"])
-check("epss_day_status: complete needs a load, no conflict, and table rows = manifest rows (> 0)",
-      all(x in main.epss_day_status_sql() for x in ("ok_loads", "conflict_rows", "table_rows = loaded_rows")))
+check("epss_day_status: complete needs a load, no conflict, and table rows = the file's rows (> 0)",
+      all(x in main.epss_day_status_sql() for x in ("ok_loads", "conflict_rows", "table_rows = file_rows")))
 
 # run_epss: after the gap fill, the final check covers the current day too
 with mock.patch.object(main, "fetch", lambda url, what, **k: url.encode()), \
@@ -351,6 +351,160 @@ check("run_kev: catalog count 3 but 1 entry read -> partial recorded, and the KE
       and manifests[-1]["records_in_scope"] == 1 and kev_err is not None and "count 3" in kev_err, str(kev_err))
 check("partial is not a done status (a partial catalog is re-checked, never 'unchanged')",
       "partial" not in main.DONE_STATUSES)
+
+
+# ================================================================ audit fixes (12 Nov review)
+# ---------------------------------------------------------------- F6: fractions of a second kept
+check("F6. iso keeps milliseconds from the source",
+      main.iso(main.parse_ts("2026-10-30T14:23:34.726Z")) == "2026-10-30T14:23:34.726000Z",
+      main.iso(main.parse_ts("2026-10-30T14:23:34.726Z")))
+check("F6. a time without fractions prints none (watermarks and batch ids keep their form)",
+      main.iso(dt.datetime(2026, 11, 1, 6, 20, tzinfo=dt.timezone.utc)) == "2026-11-01T06:20:00Z")
+row, _ = main.cve_row("cves/2026/1xxx/CVE-2026-1100.json",
+                      rec("CVE-2026-1100", "2026-10-30T14:23:34.726Z"), "b", "gs://x", T, T)
+check("F6. a cvelist row stores the publish time with its milliseconds",
+      row["date_published"] == "2026-10-30T14:23:34.726000Z", row["date_published"])
+
+# ---------------------------------------------------------------- F1: updates of known CVEs
+KNOWN = frozenset({"CVE-2026-1200", "CVE-2026-1201", "CVE-2026-1202"})
+f1 = {
+    "known CVE, publish date corrected to before the cohort -> admitted":
+        ("CVE-2026-1200", rec("CVE-2026-1200", "2026-10-07T10:00:00Z"), "row"),
+    "known CVE, PUBLISHED -> REJECTED with no datePublished -> admitted":
+        ("CVE-2026-1201", rec("CVE-2026-1201", None, state="REJECTED"), "row"),
+    "known CVE, normal update in scope -> admitted":
+        ("CVE-2026-1202", rec("CVE-2026-1202", "2026-10-20T10:00:00Z"), "row"),
+    "NEW CVE published before the cohort -> still skipped":
+        ("CVE-2026-1203", rec("CVE-2026-1203", "2026-10-07T10:00:00Z"), "skip"),
+    "NEW CVE rejected with no datePublished -> still skipped":
+        ("CVE-2026-1204", rec("CVE-2026-1204", None, state="REJECTED"), "skip"),
+}
+for label, (cid, raw, expect) in f1.items():
+    row, problem = main.cve_row(f"cves/2026/1xxx/{cid}.json", raw, "b", "gs://x", T, T, KNOWN)
+    got = "row" if row else ("problem" if problem else "skip")
+    check(f"F1. {label}", got == expect, problem or "")
+row, _ = main.cve_row("cves/2026/1xxx/CVE-2026-1201.json", rec("CVE-2026-1201", None, state="REJECTED"),
+                      "b", "gs://x", T, T, KNOWN)
+check("F1. the rejected update keeps date_published NULL (no invented date) and its state",
+      row["date_published"] is None and row["state"] == "REJECTED", str(row and row["date_published"]))
+
+# ---------------------------------------------------------------- F2: a partial cvelist file fails
+import zipfile  # noqa: E402
+
+def delta_zip(path, members):
+    with zipfile.ZipFile(path, "w") as z:
+        for name, raw in members.items():
+            z.writestr(name, raw)
+
+manifests, watermarks = [], []
+with tempfile.TemporaryDirectory() as tmpd:
+    zpath = os.path.join(tmpd, "delta.zip")
+    delta_zip(zpath, {"cves/2026/1xxx/CVE-2026-1300.json": rec("CVE-2026-1300"),
+                      "cves/2026/1xxx/CVE-2026-1301.json": b"{not json"})
+    release = {"tag_name": "cve_2026-11-12_1000Z",
+               "assets": [{"name": "2026-11-12_delta_CVEs_at_1000Z.zip", "browser_download_url": "u"}]}
+
+    def fetch_zip(url, what, stream_to=None, **_):
+        stream_to.write(open(zpath, "rb").read())
+        stream_to.flush()
+
+    inserted = []
+    with mock.patch.object(main, "latest_release", lambda: release), \
+         mock.patch.object(main, "fetch", fetch_zip), \
+         mock.patch.object(main, "land", lambda *a, **k: ("gs://raw/cvelist", T)), \
+         mock.patch.object(main, "already_loaded", lambda *a: False), \
+         mock.patch.object(main, "known_cve_ids", lambda: frozenset()), \
+         mock.patch.object(main, "insert_new_only", lambda t, rows, *a, **k: inserted.append(len(rows)) or (len(rows), 0)), \
+         mock.patch.object(main, "manifest", lambda **r: manifests.append(r)), \
+         mock.patch.object(main, "watermark_set", lambda *a, **k: watermarks.append(a)):
+        try:
+            main.run_cvelist("delta")
+            f2_err = None
+        except RuntimeError as e:
+            f2_err = str(e)
+check("F2. one good + one broken record: the good one is stored, the file is recorded partial",
+      inserted == [1] and manifests and manifests[-1]["status"] == "partial"
+      and manifests[-1]["records_failed"] == 1, str(manifests[-1:] and manifests[-1].get("status")))
+check("F2. ...and the run fails", f2_err is not None and "partial" in f2_err, str(f2_err))
+check("F2. ...and the watermark (last successful check) does NOT move", watermarks == [], str(watermarks))
+
+# ---------------------------------------------------------------- F3: NVD envelope validation
+def nvd_run(pages):
+    """Run run_nvd over the given response bodies; return (error, manifests, watermarks, inserted)."""
+    it = iter(pages)
+    mans, wms, ins = [], [], []
+    with mock.patch.object(main, "watermark_get", lambda s: ("2026-11-11T06:20:00Z", None)), \
+         mock.patch.object(main, "fetch", lambda *a, **k: next(it)), \
+         mock.patch.object(main, "land", lambda *a, **k: ("gs://raw/nvd", T)), \
+         mock.patch.object(main, "insert_new_only", lambda t, rows, *a, **k: ins.append(len(rows)) or (len(rows), 0)), \
+         mock.patch.object(main, "manifest", lambda **r: mans.append(r)), \
+         mock.patch.object(main, "watermark_set", lambda *a, **k: wms.append(a)), \
+         mock.patch.object(main, "now", lambda: dt.datetime(2026, 11, 12, 6, 20, tzinfo=dt.timezone.utc)):
+        try:
+            main.run_nvd()
+            return None, mans, wms, ins
+        except RuntimeError as e:
+            return str(e), mans, wms, ins
+
+
+def vuln(i):
+    return {"cve": {"id": f"CVE-2026-{1400 + i}", "vulnStatus": "Received", "published": "2026-11-10T10:00:00.000",
+                    "lastModified": "2026-11-11T10:00:00.123"}}
+
+
+def page(vulns, total, start=0, per=None):
+    return json.dumps({"resultsPerPage": len(vulns) if per is None else per, "startIndex": start,
+                       "totalResults": total, "vulnerabilities": vulns}).encode()
+
+
+bad_cases = {
+    "an empty object {}": [b"{}"],
+    "not JSON at all": [b"<html>maintenance</html>"],
+    "totalResults missing": [json.dumps({"resultsPerPage": 0, "startIndex": 0, "vulnerabilities": []}).encode()],
+    "page says 2 results but holds 1": [page([vuln(0)], total=2, per=2)],
+    "empty page while results remain": [page([], total=3)],
+    "startIndex is not the one requested": [page([vuln(0)], total=1, start=5)],
+    "second page missing (total 3, first page holds 2, second is {})": [page([vuln(0), vuln(1)], total=3), b"{}"],
+}
+for label, pages in bad_cases.items():
+    err, mans, wms, ins = nvd_run(pages)
+    check(f"F3. NVD {label}: run fails, page recorded invalid, no watermark",
+          err is not None and mans and mans[-1]["status"] == "invalid" and wms == [],
+          f"err={err}, status={mans[-1]['status'] if mans else None}, watermarks={len(wms)}")
+
+err, mans, wms, ins = nvd_run([page([], total=0)])
+check("F3. NVD valid empty window (totalResults 0): accepted, watermark moves",
+      err is None and [m["status"] for m in mans] == ["loaded"] and len(wms) == 1, str(err))
+err, mans, wms, ins = nvd_run([page([vuln(0), vuln(1)], total=3), page([vuln(2)], total=3, start=2)])
+check("F3. NVD two valid pages: all 3 loaded, watermark moves once",
+      err is None and ins == [2, 1] and len(wms) == 1, f"err={err}, inserted={ins}")
+rows_seen = []
+with mock.patch.object(main, "watermark_get", lambda s: ("2026-11-11T06:20:00Z", None)), \
+     mock.patch.object(main, "fetch", lambda *a, **k: page([vuln(0)], total=1)), \
+     mock.patch.object(main, "land", lambda *a, **k: ("gs://raw/nvd", T)), \
+     mock.patch.object(main, "insert_new_only", lambda t, rows, *a, **k: rows_seen.extend(rows) or (len(rows), 0)), \
+     mock.patch.object(main, "manifest", lambda **r: None), \
+     mock.patch.object(main, "watermark_set", lambda *a, **k: None), \
+     mock.patch.object(main, "now", lambda: dt.datetime(2026, 11, 12, 6, 20, tzinfo=dt.timezone.utc)):
+    main.run_nvd()
+check("F6. an NVD row stores last_modified with its milliseconds",
+      rows_seen and rows_seen[0]["last_modified"] == "2026-11-11T10:00:00.123000Z",
+      rows_seen and rows_seen[0]["last_modified"])
+
+# ---------------------------------------------------------------- EPSS: a future score_date is refused
+future = gzip.compress(b"#model_version:v2026.06.15,score_date:2026-12-25T12:55:00Z\n"
+                       b"cve,epss,percentile\nCVE-2026-0001,0.1,0.5\n")
+landed = []
+with mock.patch.object(main, "now", lambda: dt.datetime(2026, 11, 12, 6, 20, tzinfo=dt.timezone.utc)), \
+     mock.patch.object(main, "already_loaded", lambda *a: False), \
+     mock.patch.object(main, "land", lambda *a, **k: landed.append(a) or ("gs://x", T)):
+    try:
+        main.ingest_epss(future, "current", T)
+        fut_err = None
+    except RuntimeError as e:
+        fut_err = str(e)
+check("EPSS: a file dated in the future is refused before anything is stored",
+      fut_err is not None and "future" in fut_err and not landed, str(fut_err))
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)

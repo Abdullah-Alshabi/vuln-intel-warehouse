@@ -52,9 +52,13 @@ joined AS (        -- LEFT JOINs: a CVE missing from a source keeps its row, wit
 texts AS (
   SELECT
     *,
-    -- FORMAT turns NULL into the text 'NULL', so a missing value must stay NULL explicitly
+    -- FORMAT turns NULL into the text 'NULL', so a missing value must stay NULL explicitly.
+    -- The value is TRUNCATED, never rounded up: 0.09999 must read 9.99% ("below 10%"), not 10.0%.
+    -- Done in NUMERIC (exact decimals), not FLOAT64: in floats 0.0995 * 100 = 9.94999... and 0.29 * 100
+    -- = 28.99999..., which would truncate to 9.94% and 28.9%.
     IF(epss_score IS NULL, NULL,
-       CONCAT(IF(epss_score * 100 < 1, FORMAT('%.2f', epss_score * 100), FORMAT('%.1f', epss_score * 100)), '%'))
+       CONCAT(IF(epss_score < 0.1, FORMAT('%.2f', TRUNC(CAST(epss_score AS NUMERIC) * 100, 2)),
+                 FORMAT('%.1f', TRUNC(CAST(epss_score AS NUMERIC) * 100, 1))), '%'))
       AS epss_txt,
     IF(cvss_score IS NULL, NULL,
        FORMAT('CVSS %.1f (v%s, %s %s)', cvss_score, cvss_version, cvss_provider_role, cvss_provider)) AS cvss_txt

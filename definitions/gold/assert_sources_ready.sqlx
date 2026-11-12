@@ -1,6 +1,6 @@
 config {
   type: "assertion",
-  description: "Blocks publishing unless every source is present and fresh. Returns one row per problem (a NULL or missing value is a problem, not a pass). Limits (project policy): KEV and NVD checked within 30 hours, cvelist within 3 hours, EPSS score_date at most 2 calendar days before today."
+  description: "Blocks publishing unless every source is present and fresh. Returns one row per problem (a NULL or missing value is a problem, not a pass). Limits (project policy): KEV and NVD checked within 30 hours, cvelist within 3 hours, EPSS score_date at most 2 calendar days before today. A cvelist file that was only partly loaded (or quarantined) blocks publishing until a later baseline loads completely: the nightly baseline holds every CVE, so it recovers the records the earlier file lost."
 }
 
 WITH kev AS (SELECT COUNT(*) AS n, MAX(kev_checked_at) AS checked FROM ${ref("kev_current")}),
@@ -10,7 +10,14 @@ checks AS (
   QUALIFY ROW_NUMBER() OVER (PARTITION BY source ORDER BY recorded_at DESC) = 1
 ),
 nvd AS (SELECT MAX(IF(source = 'nvd', last_checked_at, NULL)) AS checked FROM checks),
-cvelist AS (SELECT MAX(IF(source = 'cvelist', last_checked_at, NULL)) AS checked FROM checks)
+cvelist AS (SELECT MAX(IF(source = 'cvelist', last_checked_at, NULL)) AS checked FROM checks),
+cvelist_files AS (
+  SELECT
+    MAX(IF(status IN ('partial', 'quarantined'), finished_at, NULL)) AS last_incomplete,
+    MAX(IF(status = 'loaded' AND batch_id LIKE '%all_CVEs_at_midnight%', finished_at, NULL)) AS last_full_baseline
+  FROM ${ref("ingest_manifest")}
+  WHERE source = 'cvelist'
+)
 
 SELECT 'KEV: no valid catalog (silver.kev_current is empty)' AS problem FROM kev WHERE n = 0
 UNION ALL
@@ -27,3 +34,7 @@ WHERE checked IS NULL OR checked < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3
 UNION ALL
 SELECT 'cvelist: last successful check unknown or older than 3 hours' FROM cvelist
 WHERE checked IS NULL OR checked < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR)
+UNION ALL
+SELECT 'cvelist: a file was only partly loaded (or quarantined) and no complete baseline has loaded since'
+FROM cvelist_files
+WHERE last_incomplete IS NOT NULL AND (last_full_baseline IS NULL OR last_full_baseline < last_incomplete)

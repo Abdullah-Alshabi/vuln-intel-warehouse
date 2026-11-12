@@ -31,8 +31,10 @@ checks AS (
     COUNTIF(cve_id IS DISTINCT FROM JSON_VALUE(record, '\$.cveMetadata.cveId')) FROM \`$P.bronze.cvelist_records\`
   UNION ALL SELECT 'cvelist', 'state is PUBLISHED or REJECTED',
     COUNTIF(state IS NULL OR state NOT IN ('PUBLISHED', 'REJECTED')) FROM \`$P.bronze.cvelist_records\`
-  UNION ALL SELECT 'cvelist', 'date_published present and inside the cohort',
-    COUNTIF(date_published IS NULL OR date_published < TIMESTAMP('${COHORT_START}')) FROM \`$P.bronze.cvelist_records\`
+  UNION ALL SELECT 'cvelist', 'the FIRST stored version of each CVE is inside the cohort (later updates of a known CVE may move out; silver decides from the latest)',
+    COUNTIF(date_published IS NULL OR date_published < TIMESTAMP('${COHORT_START}')) FROM (
+      SELECT date_published FROM \`$P.bronze.cvelist_records\`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY cve_id ORDER BY observed_at, record_hash) = 1)
   UNION ALL SELECT 'cvelist', 'date_updated not before date_published (when present)',
     COUNTIF(IFNULL(date_updated < date_published, FALSE)) FROM \`$P.bronze.cvelist_records\`
   UNION ALL SELECT 'cvelist', 'not published after we observed it (no future dates)',
