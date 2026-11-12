@@ -9,7 +9,7 @@ config {
     p2: "CVEs with priority P2 (EPSS >= 10%, not in KEV)",
     p3: "CVEs with priority P3 (CVSS >= 9.0, not P1/P2)",
     other: "CVEs with priority Other (not assessed as safe)",
-    pct_without_cvss: "Percentage of CVEs with no valid CVSS score in the data we hold",
+    pct_without_cvss: "Percentage of CVEs with no valid CVSS score selected from the data used in the selection",
     pct_without_epss: "Percentage of CVEs with no EPSS score in the chosen EPSS file",
     pct_not_in_nvd: "Percentage of CVEs with no record in the NVD data we loaded",
     pct_nvd_deferred: "Percentage of CVEs whose NVD status is Deferred",

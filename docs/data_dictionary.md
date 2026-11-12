@@ -5,7 +5,7 @@ This page describes the two objects the dashboard reads:
 - **`gold.cve_current`** (table): one row per published CVE in scope, with the latest state.
 - **`gold.coverage_summary`** (view): one row of summary numbers computed from `gold.cve_current`.
 
-The same descriptions are stored on the BigQuery columns (Dataform `columns:`), so they also show in the BigQuery console and in Looker Studio.
+The same descriptions are stored on the BigQuery columns (Dataform `columns:`), so they also show in the BigQuery console. Whether they carry over to a Looker Studio data source is checked when the data source is created; field descriptions can also be set in Looker Studio itself.
 
 ## Scope and refresh
 
@@ -19,13 +19,17 @@ The same descriptions are stored on the BigQuery columns (Dataform `columns:`), 
 
 ## Reading NULL
 
-NULL always means "we do not have this value", never 0 and never "low" or "safe".
+NULL is never 0, and never "low" or "safe". What it means depends on the column (each table below has a "NULL means" column):
+
+- **Value not available:** e.g. `cvss_score`, `epss_score`.
+- **Does not apply:** e.g. `kev_date_added` for a CVE that is not in KEV.
+- **No gap found:** `missing_data` is NULL when none of its three checks found a gap.
 
 - **No CVSS** → `cvss_score` is NULL, not 0.
 - **No EPSS** → `epss_score` is NULL. We never use an older day's score.
 - **Not in KEV** → `is_kev` is FALSE. FALSE only means the CVE is not in the catalog. It does not prove the CVE is not exploited.
 
-`missing_data` lists what is missing for each CVE, so missing values can be filtered and counted.
+`missing_data` tracks three gaps only (no CVSS, no EPSS, no NVD record), so they can be filtered and counted. It does not check every column.
 
 ## Priority rule (project policy)
 
@@ -53,8 +57,8 @@ Example values are from **CVE-2026-123158** (OpenSSH, published 2026-11-05), as 
 | `description` | STRING | English description written by the CNA | free text | the CNA gave no English description | `sshd in OpenSSH before 10.6p2 on Linux, when musl libc is used without PAM, …` |
 | `published_at` | TIMESTAMP | When CVE.org published the CVE | UTC | never NULL | `2026-11-05 15:46:26` |
 | `assigner` | STRING | Short name of the CNA that owns the record | CNA short name | not given | `mitre` |
-| `first_listed_vendor` | STRING | Vendor of the **first** affected product listed (not all of them) | free text | no affected product listed | `OpenBSD` |
-| `first_listed_product` | STRING | **First** affected product listed (not all of them) | free text | no affected product listed | `OpenSSH` |
+| `first_listed_vendor` | STRING | Vendor of the **first** affected product listed (not all of them) | free text | no value was extracted from the first affected entry (the entry may exist without this field) | `OpenBSD` |
+| `first_listed_product` | STRING | **First** affected product listed (not all of them) | free text | no value was extracted from the first affected entry (the entry may exist without this field) | `OpenSSH` |
 
 ### CVSS (source: CVE.org and NVD, via `silver.cvss_selected`)
 
@@ -90,7 +94,7 @@ This is a project policy, not proof that one provider is more accurate.
 |---|---|---|---|---|---|
 | `is_kev` | BOOL | In the latest **valid** KEV catalog (one whose entry count matched CISA's own count) | TRUE / FALSE | never NULL | `true` |
 | `kev_date_added` | DATE | When CISA added the CVE to KEV | date | not in KEV | `2026-11-09` |
-| `kev_ransomware_use` | STRING | CISA's `knownRansomwareCampaignUse` | `Known`, `Unknown` | not in KEV | `Unknown` |
+| `kev_ransomware_use` | STRING | CISA's `knownRansomwareCampaignUse` | `Known`, `Unknown` (`Unknown` does not mean it was not used in ransomware) | not in KEV | `Unknown` |
 | `kev_catalog_version` | STRING | KEV catalog version used for **every** row (one catalog per update) | CISA version string | never NULL (checked) | `2026.11.10` |
 | `kev_checked_at` | TIMESTAMP | When we last saw that catalog, same for every row | UTC | never NULL (checked) | `2026-11-11 06:21:47` |
 
@@ -100,7 +104,7 @@ This is a project policy, not proof that one provider is more accurate.
 
 | Column | Type | Meaning | Allowed values / unit | NULL means | Example |
 |---|---|---|---|---|---|
-| `epss_score` | FLOAT64 | Probability of exploitation activity in the next 30 days, for `epss_score_date` | 0–1 (show as %) | no score for this CVE in that file, e.g. a CVE newer than the file (never 0, never an older score) | `0.16501` (16.5%) |
+| `epss_score` | FLOAT64 | Estimated probability that exploitation activity for this CVE is observed in the 30 days after `epss_score_date`. Not the probability that a specific system is compromised | 0–1 (show as %) | no score for this CVE in that file, e.g. a CVE newer than the file (never 0, never an older score) | `0.16501` (16.5%) |
 | `epss_percentile` | FLOAT64 | Share of all scored CVEs with a lower or equal EPSS | 0–1 | same as `epss_score` | `0.97016` |
 | `epss_score_date` | DATE | Date of the EPSS file used, same for every row. It does **not** mean this CVE had a score in it | date (latest **complete** day in `ops.epss_day_status`) | never NULL (checked) | `2026-11-10` |
 | `epss_model_version` | STRING | EPSS model version of that file | e.g. `v2026.06.15` | not given in the file | `v2026.06.15` |
@@ -127,7 +131,7 @@ To follow one CVE through every layer, run `bash infra/trace_cve.sh <CVE-ID>`.
 |---|---|---|---|---|---|
 | `priority` | STRING | General review priority (rule above) | `P1`, `P2`, `P3`, `Other` | never NULL | `P1` |
 | `priority_reason` | STRING | Plain-English reason, with the values and sources used | text | never NULL | `In CISA KEV (added 2026-11-09)` |
-| `missing_data` | STRING | What is missing for this CVE | any of `no CVSS`, `no EPSS`, `not in NVD data`, joined by `; ` | nothing is missing | NULL |
+| `missing_data` | STRING | What is missing for this CVE | any of `no CVSS`, `no EPSS`, `not in NVD data`, joined by `; ` | none of the three tracked gaps (CVSS, EPSS, NVD record); not a sign that every column is filled | NULL |
 | `updated_at` | TIMESTAMP | When this published result was built: the start time of the statement that built `gold.cve_current`. The same for every row | UTC | never NULL | `2026-11-11 16:55:31` |
 
 More `priority_reason` examples:
@@ -148,7 +152,7 @@ This is one row, computed from `gold.cve_current` only, so its numbers always ma
 | `cves_in_scope` | Published CVEs in the result | `20606` |
 | `in_kev` | CVEs in the latest valid KEV catalog | `27` |
 | `p1` / `p2` / `p3` / `other` | CVEs per priority (they add up to `cves_in_scope`) | `27` / `3` / `1813` / `18763` |
-| `pct_without_cvss` | % of CVEs with no valid CVSS score in the data we hold | `5.2` |
+| `pct_without_cvss` | % of CVEs for which no valid CVSS score was selected from the data used in the selection (not proof that no score exists anywhere) | `5.2` |
 | `pct_without_epss` | % of CVEs with no score in the chosen EPSS file | `10.8` |
 | `pct_not_in_nvd` | % of CVEs with no record in the NVD data we loaded | `0.9` |
 | `pct_nvd_deferred` | % of CVEs whose NVD status is `Deferred` | `36.8` |
@@ -158,7 +162,7 @@ This is one row, computed from `gold.cve_current` only, so its numbers always ma
 
 ## Known limitations
 
-- **One state per CVE.** There is no history, so you cannot ask "what was the priority on date X". A historical as-of view, SCD2 and replay are deferred.
+- **Gold shows the current state only.** Raw files and bronze keep earlier versions, but historical priority reporting ("what was the priority on date X") is not provided. A historical as-of view, SCD2 and replay are deferred.
 - **Vendor and product are the first ones listed** in the CVE record. They are not normalised, and they are not the full affected list.
 - **CVSS versions are not comparable.** A v4.0 8.1 and a v3.1 8.1 are not the same measurement.
 - **KEV FALSE does not prove a CVE is not exploited.** The **EPSS threshold of 10%** and the **CVSS threshold of 9.0** are project choices, not industry standards.

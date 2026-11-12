@@ -13,9 +13,9 @@ config {
     description: "English description written by the CNA (NULL if none)",
     published_at: "When CVE.org published the CVE (UTC)",
     assigner: "Short name of the CNA that owns the CVE record",
-    first_listed_vendor: "Vendor of the FIRST affected product listed (not all of them)",
-    first_listed_product: "FIRST affected product listed (not all of them)",
-    cvss_score: "Chosen CVSS base score, 0-10; NULL = no valid score in the data we hold (never 0)",
+    first_listed_vendor: "Vendor of the FIRST affected entry listed (not all of them); NULL = no value extracted from that entry",
+    first_listed_product: "Product of the FIRST affected entry listed (not all of them); NULL = no value extracted from that entry",
+    cvss_score: "Chosen CVSS base score, 0-10; NULL = no valid score selected from the data used in the selection (never 0)",
     cvss_version: "CVSS version of the chosen score (4.0, 3.1, 3.0, 2.0); versions are not comparable",
     cvss_severity: "Severity text given by the source with the chosen score; NULL if none",
     cvss_provider: "Who wrote the chosen score (CNA/ADP name or NVD source)",
@@ -26,8 +26,8 @@ config {
     cvss_selection_reason: "Why this CVSS score was chosen (see silver.cvss_selected)",
     is_kev: "TRUE if the CVE is in the latest valid CISA KEV catalog. FALSE does not prove it is not exploited",
     kev_date_added: "When CISA added the CVE to KEV; NULL when not in KEV",
-    kev_ransomware_use: "CISA's knownRansomwareCampaignUse: Known or Unknown; NULL when not in KEV",
-    epss_score: "EPSS probability (0-1) of exploitation in the next 30 days, for epss_score_date; NULL = no score for this CVE in that file (never 0, never an older score). Shown as a percentage",
+    kev_ransomware_use: "CISA's knownRansomwareCampaignUse: Known or Unknown (Unknown does not mean it was not used); NULL when not in KEV",
+    epss_score: "Estimated probability (0-1) that exploitation activity for this CVE is observed in the 30 days after epss_score_date (not the probability that a specific system is compromised); NULL = no score for this CVE in that file (never 0, never an older score). Shown as a percentage",
     epss_percentile: "Share of all scored CVEs with a lower or equal EPSS (0-1); NULL with epss_score",
     nvd_status: "NVD's vulnStatus from the latest NVD record we loaded; NULL = no record in the NVD data we loaded",
     kev_catalog_version: "CISA KEV catalog version used for every row (one catalog per update)",
@@ -39,7 +39,7 @@ config {
     cvss_record_hash: "Fingerprint of the record version the chosen score belongs to",
     priority: "General review priority (project rule, in order): P1 = in KEV; P2 = EPSS >= 10%; P3 = CVSS >= 9.0; Other = the rest. Not a fix priority for any specific organisation; Other is not 'safe'",
     priority_reason: "Plain-English reason for the priority, with the values and sources used",
-    missing_data: "What is missing for this CVE (no CVSS; no EPSS; not in NVD data), NULL if nothing is missing",
+    missing_data: "Which of three tracked gaps apply (no CVSS; no EPSS; not in NVD data); NULL = none of the three, not that every column is filled",
     updated_at: "When this published result was built (UTC): the time the statement that built this table started"
   }
 }
