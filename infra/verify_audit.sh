@@ -29,8 +29,8 @@ SELECT
 FROM \`$P.ops.ingest_manifest\` WHERE source = 'cvelist'"
 
 q "F5: EPSS text near the 10% threshold (expected: 9.99% / 9.95% / 10.0% / 16.5% / 29.0% / 0.45%)" "
-SELECT epss, CONCAT(IF(epss * 100 < 10, FORMAT('%.2f', TRUNC(ROUND(epss * 100, 6), 2)),
-                       FORMAT('%.1f', TRUNC(ROUND(epss * 100, 6), 1))), '%') AS shown
+SELECT epss, CONCAT(IF(epss < 0.1, FORMAT('%.2f', TRUNC(CAST(epss AS NUMERIC) * 100, 2)),
+                       FORMAT('%.1f', TRUNC(CAST(epss AS NUMERIC) * 100, 1))), '%') AS shown
 FROM UNNEST([0.09999, 0.0995, 0.1, 0.16501, 0.29, 0.0045]) AS epss"
 
 q "F6: precise source dates vs the typed bronze columns (expected: differ only by < 1 second)" "
