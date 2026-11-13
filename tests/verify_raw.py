@@ -88,7 +88,7 @@ g = rows(f"SELECT cve_id, epss_score, epss_percentile, epss_score_date FROM `{P}
 wrong = [r.cve_id for r in g if (file_scores.get(r.cve_id) or (None, None)) != (r.epss_score, r.epss_percentile)]
 check("EPSS -> gold: every gold CVE's score is exactly the file's value, and NULL exactly when the file has none",
       not wrong, f"{len(g):,} gold rows, {len(wrong)} wrong {wrong[:3]}")
-check("EPSS -> gold: every gold row names this EPSS day", all(r.epss_score_date == e.d for r in g), str(e.d))
+check("EPSS -> gold: every gold row names this EPSS day", all(r.epss_score_date == d for r in g), str(d))
 
 # ============================================================ KEV: the catalog gold used
 print("\n== KEV (the catalog the published gold uses)")

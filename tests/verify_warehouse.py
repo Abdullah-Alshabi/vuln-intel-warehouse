@@ -39,20 +39,32 @@ def examples(expr):
 
 
 print("== 1. manifest -> bronze (every stored row is accounted for by a recorded file)")
-run("manifest: every loaded/unchanged/partial/conflicts entry names its raw file and a sha256",
+run("manifest: every loaded/partial/conflicts entry names its raw file and a sha256",
     f"""SELECT COUNT(*) failing, {examples("CONCAT(source, ' ', batch_id)")} detail FROM {M}
-        WHERE status IN ('loaded', 'unchanged', 'partial', 'conflicts')
+        WHERE status IN ('loaded', 'partial', 'conflicts')
           AND (file_uri IS NULL OR NOT REGEXP_CONTAINS(IFNULL(sha256, ''), r'^[0-9a-f]{{64}}$'))""")
-for t in ("cvelist_records", "nvd_records", "kev_records", "epss_scores_v2"):
+# 'unchanged' = we downloaded the same file again; it is not stored twice, so it has no file of its own,
+# but its sha256 must be the one of a file we stored before
+run("manifest: every 'unchanged' entry has a sha256 equal to a file already stored",
+    f"""SELECT COUNT(*) failing, {examples("CONCAT(u.source, ' ', u.batch_id)")} detail FROM {M} u
+        WHERE u.status = 'unchanged' AND NOT EXISTS (
+          SELECT 1 FROM {M} l WHERE l.sha256 = u.sha256 AND l.file_uri IS NOT NULL
+            AND l.status IN ('loaded', 'partial', 'conflicts'))""")
+# manifest rows written before 9 Nov have no 'target' column value: they are matched by source
+for t, src in (("cvelist_records", "cvelist"), ("nvd_records", "nvd"), ("kev_records", "kev"), ("epss_scores_v2", None)):
+    which = f"target = '{P}.bronze.{t}'" + (f" OR (target IS NULL AND source = '{src}')" if src else "")
     run(f"bronze.{t}: rows per batch = the rows the manifest says that batch added (no lost, no extra rows)",
         f"""WITH t AS (SELECT batch_id, COUNT(*) n FROM {B[t]} GROUP BY 1),
                  m AS (SELECT batch_id, SUM(IFNULL(records_new, 0)) n FROM {M}
-                       WHERE target = '{P}.bronze.{t}' GROUP BY 1)
+                       WHERE {which} GROUP BY 1)
             SELECT COUNT(*) failing, {examples("CONCAT(batch_id, ': table ', CAST(IFNULL(t.n, 0) AS STRING), ' vs manifest ', CAST(IFNULL(m.n, 0) AS STRING))")} detail
             FROM t FULL JOIN m USING (batch_id) WHERE IFNULL(t.n, 0) != IFNULL(m.n, 0)""")
-run("bronze.kev_snapshots: every 'loaded' KEV catalog stored exactly CISA's count of members",
+# a catalog loaded before kev_snapshots existed (6 Nov) has no membership stored: silver.kev_current never
+# uses it (it needs stored members = CISA's count). A catalog with SOME members but not all is a failure.
+run("bronze.kev_snapshots: no 'loaded' KEV catalog has a partial membership (some members, not CISA's count)",
     f"""WITH s AS (SELECT batch_id, COUNT(DISTINCT cve_id) n FROM {B['kev_snapshots']} GROUP BY 1)
-        SELECT COUNT(*) failing, {examples("CONCAT(m.batch_id, ': ', CAST(IFNULL(s.n, 0) AS STRING), ' vs ', CAST(m.records_seen AS STRING))")} detail
+        SELECT COUNTIF(IFNULL(s.n, 0) > 0) failing,
+          {examples("CONCAT(m.batch_id, ': ', CAST(IFNULL(s.n, 0) AS STRING), ' vs ', CAST(m.records_seen AS STRING))")} detail
         FROM {M} m LEFT JOIN s USING (batch_id)
         WHERE m.source = 'kev' AND m.status = 'loaded' AND IFNULL(s.n, 0) != m.records_seen""")
 run("ops.epss_day_status: every day from the cohort start to the latest complete day is complete",
@@ -61,12 +73,17 @@ run("ops.epss_day_status: every day from the cohort start to the latest complete
         LEFT JOIN `{P}.ops.epss_day_status` s ON s.score_date = d WHERE NOT IFNULL(s.complete, FALSE)""")
 
 print("\n== 2. bronze -> silver (silver re-derived from bronze with the documented rules)")
+# silver tables are rebuilt by Dataform (daily); bronze keeps receiving hourly cvelist files after that.
+# Re-derive silver only from the bronze rows that existed when silver was built.
+SILVER_BUILT = f"""(SELECT TIMESTAMP_MILLIS(last_modified_time) FROM `{P}.silver.__TABLES__`
+                      WHERE table_id = 'cve_latest')"""
+CVE_ROWS = f"(SELECT * FROM {B['cvelist_records']} WHERE processed_at <= {SILVER_BUILT})"
 run("silver.cve_latest: the chosen version of every CVE = the newest stored version (re-derived), scope applied after",
     f"""WITH b AS (
           SELECT cve_id, record_hash, observed_at,
             COALESCE(SAFE.TIMESTAMP(JSON_VALUE(record, '$.cveMetadata.datePublished')), date_published) pub,
             COALESCE(SAFE.TIMESTAMP(JSON_VALUE(record, '$.cveMetadata.dateUpdated')), date_updated) upd
-          FROM {B['cvelist_records']}
+          FROM {CVE_ROWS}
           QUALIFY ROW_NUMBER() OVER (PARTITION BY cve_id ORDER BY COALESCE(upd, pub) DESC, observed_at DESC,
                                      record_hash DESC) = 1),
         expected AS (SELECT cve_id, record_hash FROM b WHERE pub >= TIMESTAMP('{COHORT}'))
@@ -75,7 +92,7 @@ run("silver.cve_latest: the chosen version of every CVE = the newest stored vers
         WHERE e.record_hash IS DISTINCT FROM s.record_hash""")
 run("silver.cve_latest: versions_stored = the versions bronze holds",
     f"""SELECT COUNT(*) failing, {examples("cve_id")} detail FROM {S['cve_latest']} s
-        JOIN (SELECT cve_id, COUNT(*) n FROM {B['cvelist_records']} GROUP BY 1) b USING (cve_id)
+        JOIN (SELECT cve_id, COUNT(*) n FROM {CVE_ROWS} GROUP BY 1) b USING (cve_id)
         WHERE s.versions_stored != b.n""")
 run("silver.nvd_latest: one row per CVE in bronze NVD, the version with the newest lastModified",
     f"""WITH b AS (SELECT cve_id, record_hash FROM {B['nvd_records']}
@@ -175,10 +192,16 @@ run("ops.source_watermarks: cvelist checked in the last 3 hours, NVD/KEV/EPSS in
                        INTERVAL IF(source = 'cvelist', 3, 30) HOUR)) failing,
                {examples("CONCAT(source, ' ', CAST(last_checked_at AS STRING))")} detail
         FROM (SELECT source, MAX(last_checked_at) last_checked_at FROM `{P}.ops.source_watermarks` GROUP BY 1)""")
-run("ops.ingest_runs: no failed run in the last 48 hours",
-    f"""SELECT COUNTIF(status != 'succeeded') failing,
-               {examples("IF(status != 'succeeded', CONCAT(mode, ' ', CAST(started_at AS STRING), ' ', SUBSTR(IFNULL(error, ''), 1, 80)), NULL)")} detail
-        FROM `{P}.ops.ingest_runs` WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)""")
+# each run writes a 'started' row and an end row ('succeeded' or 'failed'); a run with no end row after
+# 2 hours (the job timeout is 1 hour) crashed without recording its end
+run("ops.ingest_runs: in the last 48 hours, no failed run and no run that never finished",
+    f"""WITH r AS (SELECT run_id, ANY_VALUE(mode) mode, MIN(started_at) started_at,
+                         LOGICAL_OR(status = 'failed') failed, LOGICAL_OR(status IN ('succeeded', 'failed')) ended,
+                         STRING_AGG(error, ' ') error
+                  FROM `{P}.ops.ingest_runs` GROUP BY 1)
+        SELECT COUNTIF(failed OR (NOT ended AND started_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR))) failing,
+          {examples("IF(failed OR NOT ended, CONCAT(mode, ' ', CAST(started_at AS STRING), IF(failed, ' failed: ', ' never finished'), SUBSTR(IFNULL(error, ''), 1, 80)), NULL)")} detail
+        FROM r WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)""")
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)
