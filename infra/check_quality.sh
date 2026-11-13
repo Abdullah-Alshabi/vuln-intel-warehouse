@@ -109,8 +109,10 @@ while rows and isinstance(rows[0], list):  # tolerate a nested result shape
 bad = 0
 print(f"{'src':8} {'failing':>8}  result  rule")
 for r in rows:
-    n = int(r["failing"] or 0); bad += n > 0
-    print(f"{r['src']:8} {n:>8}  {'PASS' if n == 0 else 'CHECK'}   {r['rule']}")
+    # a NULL count means the rule could not be evaluated: that is a failure, never a pass
+    n = None if r["failing"] is None else int(r["failing"])
+    bad += n != 0
+    print(f"{r['src']:8} {str(n):>8}  {'PASS' if n == 0 else 'CHECK'}   {r['rule']}")
 print(f"\n{len(rows) - bad}/{len(rows)} rules pass")
 open("/tmp/dq_bad", "w").write(str(bad))
 PY
