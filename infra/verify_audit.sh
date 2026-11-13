@@ -21,6 +21,12 @@ SELECT COUNT(*) days,
   COUNTIF((table_rows = old_rows) IS DISTINCT FROM (table_rows = new_rows)) days_that_differ
 FROM m JOIN t USING (score_date) WHERE score_date IS NOT NULL"
 
+q "F4 (review 8): days with two loaded EPSS files of different sizes (expected: 0; such a day is no longer complete)" "
+SELECT COUNT(*) days_with_different_files FROM (
+  SELECT SPLIT(batch_id, ':')[SAFE_OFFSET(1)] d
+  FROM \`$P.ops.ingest_manifest\` WHERE target = '$P.bronze.epss_scores_v2' AND status = 'loaded'
+  GROUP BY 1 HAVING MIN(records_in_scope) != MAX(records_in_scope))"
+
 q "F2: the new gate on today's manifest (expected: blocked = false)" "
 SELECT
   MAX(IF(status IN ('partial', 'quarantined'), finished_at, NULL)) last_incomplete,
