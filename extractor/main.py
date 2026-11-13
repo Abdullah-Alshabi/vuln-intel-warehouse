@@ -929,8 +929,11 @@ def main():
         record_run("succeeded", started)
         return 0
     except Exception as e:  # noqa: BLE001
-        error("run failed", error=str(e)[:1000])
-        record_run("failed", started, str(e))
+        # the exception type is always written: some errors have an empty message
+        # (the cvelist_baseline failure of 11 Nov was recorded with no message at all)
+        reason = f"{type(e).__name__}: {e}"
+        error("run failed", error=reason[:1000])
+        record_run("failed", started, reason)
         return 1
 
 

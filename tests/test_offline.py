@@ -2,6 +2,7 @@
 Google client libraries are replaced with stubs, so this runs anywhere:
     python3 tests/test_offline.py
 """
+import contextlib
 import datetime as dt
 import json
 import os
@@ -505,6 +506,16 @@ with mock.patch.object(main, "now", lambda: dt.datetime(2026, 11, 12, 6, 20, tzi
         fut_err = str(e)
 check("EPSS: a file dated in the future is refused before anything is stored",
       fut_err is not None and "future" in fut_err and not landed, str(fut_err))
+
+# ---------------------------------------------------------------- a failed run always names its error
+runs = []
+with mock.patch.object(main, "ensure_tables", lambda: None), \
+     mock.patch.object(main, "record_run", lambda status, started, err=None: runs.append((status, err))), \
+     mock.patch.dict(main.RUNNERS, {main.MODE: lambda: (_ for _ in ()).throw(TimeoutError())}), \
+     mock.patch.object(main, "Lock", lambda *a: contextlib.nullcontext()):
+    main.main()
+check("a failed run records the exception type even when its message is empty",
+      runs[-1] == ("failed", "TimeoutError: "), str(runs[-1]))
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)
