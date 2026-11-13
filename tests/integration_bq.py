@@ -136,16 +136,16 @@ except RuntimeError as e:
 retry_date, retry_new = main.ingest_epss(f4_body, "f4 retry", main.now())
 main.manifest = real_manifest
 f4 = one(f"SELECT complete, file_rows, table_rows FROM `{main.V_EPSS_DAYS}` WHERE score_date = '{day(5)}'")[0]
-lineage = one(f"SELECT b.n table_n, m.in_table, m.new FROM (SELECT batch_id, COUNT(*) n FROM `{E}` "
+lineage = one(f"SELECT b.n table_n, m.in_table, m.new_rows FROM (SELECT batch_id, COUNT(*) n FROM `{E}` "
               f"WHERE score_date = '{day(5)}' GROUP BY 1) b JOIN (SELECT batch_id, MAX(records_in_table) in_table, "
-              f"SUM(records_new) new FROM `{main.MANIFEST}` GROUP BY 1) m USING (batch_id)")[0]
+              f"SUM(records_new) new_rows FROM `{main.MANIFEST}` GROUP BY 1) m USING (batch_id)")[0]
 check("F4. INSERT ok then manifest failed: the first try fails", "injected" in first, first)
 check("F4. ...the retry inserts 0 new rows and is recorded loaded", retry_new == 0, retry_new)
 check("F4. ...and the day is complete (table rows = the file's rows), not stuck incomplete",
       f4.complete and f4.file_rows == 3 and f4.table_rows == 3, dict(f4.items()))
 check("F4 lineage. after the retry the manifest still accounts for every row of the batch "
       "(records_in_table = 3 although records_new = 0)",
-      lineage.in_table == 3 and lineage.table_n == 3 and lineage.new == 0, dict(lineage.items()))
+      lineage.in_table == 3 and lineage.table_n == 3 and lineage.new_rows == 0, dict(lineage.items()))
 
 # Review 8: two DIFFERENT files for one day (100 rows, then 90 of them): the table matches only one of
 # them, so the day must not be complete (here: 3 rows, then a second file of 2 of those rows)
