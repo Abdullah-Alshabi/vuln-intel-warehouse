@@ -55,7 +55,9 @@ for t, src in (("cvelist_records", "cvelist"), ("nvd_records", "nvd"), ("kev_rec
     which = f"target = '{P}.bronze.{t}'" + (f" OR (target IS NULL AND source = '{src}')" if src else "")
     run(f"bronze.{t}: rows per batch = the rows the manifest says that batch added (no lost, no extra rows)",
         f"""WITH t AS (SELECT batch_id, COUNT(*) n FROM {B[t]} GROUP BY 1),
-                 m AS (SELECT batch_id, SUM(IFNULL(records_new, 0)) n FROM {M}
+                 -- records_in_table (since 13 Nov) counts the batch's rows after the load, so it stays right
+                 -- after a retry that inserted 0; older entries only have records_new
+                 m AS (SELECT batch_id, COALESCE(MAX(records_in_table), SUM(IFNULL(records_new, 0))) n FROM {M}
                        WHERE {which} GROUP BY 1)
             SELECT COUNT(*) failing, {examples("CONCAT(batch_id, ': table ', CAST(IFNULL(t.n, 0) AS STRING), ' vs manifest ', CAST(IFNULL(m.n, 0) AS STRING))")} detail
             FROM t FULL JOIN m USING (batch_id) WHERE IFNULL(t.n, 0) != IFNULL(m.n, 0)""")

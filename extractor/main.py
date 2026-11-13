@@ -34,6 +34,7 @@ import re
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 import zipfile
 
@@ -185,7 +186,8 @@ TABLES = {
                       ("status", "STRING"), ("detail", "STRING"),
                       ("started_at", "TIMESTAMP"), ("finished_at", "TIMESTAMP"),
                       ("target", "STRING"), ("processor", "STRING"), ("records_failed", "INT64"),
-                      ("records_conflicting", "INT64"), ("acquired_at", "TIMESTAMP")),
+                      ("records_conflicting", "INT64"), ("acquired_at", "TIMESTAMP"),
+                      ("records_in_table", "INT64")),
                "finished_at", None),
     WATERMARKS: (schema(("source", "STRING"), ("watermark", "STRING"), ("last_checked_at", "TIMESTAMP"),
                         ("last_changed_at", "TIMESTAMP"), ("run_id", "STRING"),
@@ -238,22 +240,26 @@ def ensure_tables():
 
 def epss_day_status_sql():
     """One row per EPSS score_date. complete = a successful load into the table, no conflict,
-    and the table holds exactly as many rows as the file has (and more than 0).
+    and the table holds exactly as many rows as EVERY loaded file of that day has (and more than 0).
     file_rows is the file's row count (records_in_scope), not the rows inserted by that load:
     after a load without conflicts every key of the file is in the table with the same values,
-    so equal counts mean an exact match, even when a retry inserted nothing new.
+    so equal counts mean an exact match, even when a retry inserted nothing new. If two different
+    files were loaded for one day (e.g. 100 rows, then 90 of them), the table matches only one of
+    them: MIN and MAX of the file sizes differ, so the day is NOT complete (fail-closed).
     The extractor's gap fill and Dataform's epss_latest both read this view: one definition."""
     return f"""
     WITH m AS (
       SELECT SAFE.PARSE_DATE('%Y-%m-%d', SPLIT(batch_id, ':')[SAFE_OFFSET(1)]) AS score_date,
         COUNTIF(status = 'loaded') AS ok_loads, COUNTIF(status = 'conflicts') AS conflict_rows,
-        MAX(IF(status = 'loaded', records_in_scope, NULL)) AS file_rows
+        MAX(IF(status = 'loaded', records_in_scope, NULL)) AS file_rows,
+           MIN(IF(status = 'loaded', records_in_scope, NULL)) AS file_rows_min
       FROM `{MANIFEST}` WHERE target = '{T_EPSS}' GROUP BY 1),
     t AS (SELECT score_date, COUNT(*) AS table_rows FROM `{T_EPSS}` GROUP BY 1)
     SELECT score_date, IFNULL(ok_loads, 0) AS ok_loads, IFNULL(conflict_rows, 0) AS conflict_rows,
-      IFNULL(file_rows, 0) AS file_rows, IFNULL(table_rows, 0) AS table_rows,
+      IFNULL(file_rows, 0) AS file_rows, IFNULL(file_rows_min, 0) AS file_rows_min, IFNULL(table_rows, 0) AS table_rows,
       (IFNULL(ok_loads, 0) > 0 AND IFNULL(conflict_rows, 0) = 0
-       AND IFNULL(table_rows, 0) > 0 AND table_rows = file_rows) AS complete
+       AND IFNULL(table_rows, 0) > 0 AND table_rows = file_rows
+           AND table_rows = file_rows_min) AS complete
     FROM m FULL OUTER JOIN t USING (score_date)
     WHERE score_date IS NOT NULL"""
 
@@ -323,6 +329,16 @@ def insert_new_only(table_id, rows, key_cols, compare_cols=()):
         return job.num_dml_affected_rows or 0, conflicts
     finally:
         bq.delete_table(stage, not_found_ok=True)
+
+
+def rows_in_table(table_id, batch_id, where="TRUE"):
+    """Lineage count: rows of table_id that carry batch_id AFTER this load. Unlike records_new (rows
+    inserted by this very load), it is also right after a retry: if an earlier attempt inserted the
+    rows and then failed before writing the manifest, the retry inserts 0 but the rows are counted."""
+    job = bq.query(f"SELECT COUNT(*) n FROM `{table_id}` WHERE batch_id = @b AND {where}",
+                   job_config=bigquery.QueryJobConfig(
+                       query_parameters=[bigquery.ScalarQueryParameter("b", "STRING", batch_id)]))
+    return list(job.result())[0].n
 
 
 def manifest(**row):
@@ -513,6 +529,7 @@ def ingest_cvelist_zip(zip_path, source, batch_id, file_uri, file_sha, size, sta
         raise RuntimeError("too many bad records; file quarantined")
     new, _ = insert_new_only(T_CVELIST, rows, ["cve_id", "record_hash"])
     manifest(**common, records_in_scope=len(rows), records_new=new,
+             records_in_table=rows_in_table(T_CVELIST, batch_id),
              status="partial" if problems else "loaded", detail="; ".join(problems[:5]))
     if problems:
         error("cvelist records skipped", count=len(problems), examples=problems[:5])
@@ -574,6 +591,16 @@ def nvd_page_checked(d, idx):
         raise ValueError(f"NVD page is empty at {idx} of {total}")
     if idx + per_page > total:
         raise ValueError(f"NVD page goes past totalResults ({idx}+{per_page} > {total})")
+    for i, v in enumerate(vulns):  # a well-formed envelope can still hold a broken record
+        c = v.get("cve") if isinstance(v, dict) else None
+        if not isinstance(c, dict) or not re.fullmatch(r"CVE-\d{4}-\d{4,}", str(c.get("id"))) \
+                or not isinstance(c.get("vulnStatus"), str):
+            raise ValueError(f"NVD record {idx + i} is not a readable CVE record")
+        try:
+            if parse_ts(c.get("published")) is None or parse_ts(c.get("lastModified")) is None:
+                raise ValueError("missing date")
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"NVD record {idx + i} ({c.get('id')}): bad published/lastModified ({e})") from e
     return vulns, total, per_page
 
 
@@ -623,6 +650,7 @@ def run_nvd():
             manifest(source="nvd", batch_id=batch_id, request=q, file_uri=file_uri, sha256=sha256(body),
                      bytes=len(body), records_seen=len(vulns),
                      records_in_scope=len(rows), records_new=new, status="loaded", target=T_NVD,
+                     records_in_table=rows_in_table(T_NVD, batch_id),
                      acquired_at=iso(acquired), started_at=iso(started))
             idx += per_page
             page += 1
@@ -677,6 +705,7 @@ def run_kev():
     insert_new_only(T_KEV_SNAP, members, ["batch_id", "cve_id"])
     manifest(source="kev", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
              records_seen=published, records_in_scope=len(records), records_new=new,
+             records_in_table=rows_in_table(T_KEV, batch_id),
              records_failed=0 if count_ok else abs((published or 0) - len(records)),
              status="loaded" if count_ok else "partial", target=T_KEV,
              detail=f"catalog {version}: CISA count {published}, entries read {len(records)}",
@@ -732,6 +761,7 @@ def ingest_epss(body, label, started, file_uri=None, acquired=None, expected_dat
               score_date=score_date, conflicts=conflicts, file_uri=file_uri)
     manifest(source="epss", batch_id=batch_id, file_uri=file_uri, sha256=file_sha, bytes=len(body),
              records_seen=len(rows), records_in_scope=len(rows), records_new=new,
+             records_in_table=rows_in_table(T_EPSS, batch_id, f"score_date = '{score_date}'"),
              records_conflicting=conflicts, status="conflicts" if conflicts else "loaded", target=T_EPSS,
              detail=f"{label}; model {model}", acquired_at=iso(acquired), started_at=iso(started))
     if conflicts:
@@ -932,7 +962,7 @@ def main():
         # the exception type is always written: some errors have an empty message
         # (the cvelist_baseline failure of 11 Nov was recorded with no message at all)
         reason = f"{type(e).__name__}: {e}"
-        error("run failed", error=reason[:1000])
+        error("run failed", error=reason[:1000], traceback=traceback.format_exc()[-4000:])
         record_run("failed", started, reason)
         return 1
 

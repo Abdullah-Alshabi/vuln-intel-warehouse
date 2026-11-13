@@ -34,6 +34,7 @@ import main  # noqa: E402
 
 main.time.sleep = lambda *_: None
 main.log.disabled = True
+main.rows_in_table = lambda table_id, batch_id, where='TRUE': None  # BigQuery count: tested in integration_bq.py
 RESULTS = []
 
 
@@ -306,7 +307,7 @@ with mock.patch.object(main, "bq", types.SimpleNamespace(query=fake_query)):
 check("epss_gap_days: expected days come from GENERATE_DATE_ARRAY joined to the shared status view",
       gaps == ["2026-11-09"] and "GENERATE_DATE_ARRAY" in captured["q"] and main.V_EPSS_DAYS in captured["q"])
 check("epss_day_status: complete needs a load, no conflict, and table rows = the file's rows (> 0)",
-      all(x in main.epss_day_status_sql() for x in ("ok_loads", "conflict_rows", "table_rows = file_rows")))
+      all(x in main.epss_day_status_sql() for x in ("ok_loads", "conflict_rows", "table_rows = file_rows", "table_rows = file_rows_min")))
 
 # run_epss: after the gap fill, the final check covers the current day too
 with mock.patch.object(main, "fetch", lambda url, what, **k: url.encode()), \
@@ -491,6 +492,18 @@ with mock.patch.object(main, "watermark_get", lambda s: ("2026-11-11T06:20:00Z",
 check("F6. an NVD row stores last_modified with its milliseconds",
       rows_seen and rows_seen[0]["last_modified"] == "2026-11-11T10:00:00.123000Z",
       rows_seen and rows_seen[0]["last_modified"])
+
+err, mans, wms, ins = nvd_run([page([{}], total=1)])
+check("F3. NVD envelope is well formed but its record is empty ([{}]): run fails, recorded invalid, no watermark",
+      err is not None and mans and mans[-1]["status"] == "invalid" and wms == [] and ins == [],
+      f"err={err}, watermarks={len(wms)}")
+bad_date = vuln(0)
+bad_date["cve"]["lastModified"] = "not-a-date"
+err, mans, wms, ins = nvd_run([page([bad_date], total=1)])
+check("F3. NVD record with an unreadable lastModified: run fails, no watermark", err is not None and wms == [], str(err))
+err, mans, wms, ins = nvd_run([page([vuln(0), vuln(1)], total=3), page([vuln(2)], total=3, start=2)])
+check("F3. NVD last page holding fewer records than the page size (2 then 1 of 3), as NVD returns it: accepted",
+      err is None and ins == [2, 1], str(err))
 
 # ---------------------------------------------------------------- EPSS: a future score_date is refused
 future = gzip.compress(b"#model_version:v2026.06.15,score_date:2026-12-25T12:55:00Z\n"

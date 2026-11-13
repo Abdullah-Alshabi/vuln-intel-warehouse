@@ -136,17 +136,34 @@ except RuntimeError as e:
 retry_date, retry_new = main.ingest_epss(f4_body, "f4 retry", main.now())
 main.manifest = real_manifest
 f4 = one(f"SELECT complete, file_rows, table_rows FROM `{main.V_EPSS_DAYS}` WHERE score_date = '{day(5)}'")[0]
+lineage = one(f"SELECT b.n table_n, m.in_table, m.new FROM (SELECT batch_id, COUNT(*) n FROM `{E}` "
+              f"WHERE score_date = '{day(5)}' GROUP BY 1) b JOIN (SELECT batch_id, MAX(records_in_table) in_table, "
+              f"SUM(records_new) new FROM `{main.MANIFEST}` GROUP BY 1) m USING (batch_id)")[0]
 check("F4. INSERT ok then manifest failed: the first try fails", "injected" in first, first)
 check("F4. ...the retry inserts 0 new rows and is recorded loaded", retry_new == 0, retry_new)
 check("F4. ...and the day is complete (table rows = the file's rows), not stuck incomplete",
       f4.complete and f4.file_rows == 3 and f4.table_rows == 3, dict(f4.items()))
+check("F4 lineage. after the retry the manifest still accounts for every row of the batch "
+      "(records_in_table = 3 although records_new = 0)",
+      lineage.in_table == 3 and lineage.table_n == 3 and lineage.new == 0, dict(lineage.items()))
+
+# Review 8: two DIFFERENT files for one day (100 rows, then 90 of them): the table matches only one of
+# them, so the day must not be complete (here: 3 rows, then a second file of 2 of those rows)
+put(6, 3, 3)
+main.manifest(source="epss", batch_id=f"epss:{day(6)}:second", status="loaded", records_new=0,
+              records_in_scope=2, target=E)
+two = one(f"SELECT complete, file_rows, file_rows_min, table_rows FROM `{main.V_EPSS_DAYS}` "
+          f"WHERE score_date = '{day(6)}'")[0]
+check("F4. two different files for one day (3 rows, then 2 of them): NOT complete", not two.complete,
+      dict(two.items()))
 
 saved_start = main.COHORT_START_TS
 main.COHORT_START_TS = dt.datetime(1999, 1, 1, tzinfo=dt.timezone.utc)
-gaps = main.epss_gap_days(day(6))
+gaps = main.epss_gap_days(day(7))
 main.COHORT_START_TS = saved_start
 check("3g. gap days on real BigQuery: a failed day behind a later good day, a row-count mismatch, "
-      "and a conflict day are all reported (and the F4 day is not)", gaps == [day(1), day(3), day(4)], str(gaps))
+      "a conflict day and the two-file day are all reported (and the F4 retry day is not)",
+      gaps == [day(1), day(3), day(4), day(6)], str(gaps))
 
 # ------------------------------------------------------------ F1: known CVE ids come from bronze
 main.load_json_rows(main.T_CVELIST, [{"cve_id": "CVE-1999-0001", "state": "PUBLISHED", "record_hash": "x",
