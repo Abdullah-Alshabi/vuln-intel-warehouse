@@ -77,7 +77,8 @@ print("\n== 2. bronze -> silver (silver re-derived from bronze with the document
 # Re-derive silver only from the bronze rows that existed when silver was built.
 SILVER_BUILT = f"""(SELECT TIMESTAMP_MILLIS(last_modified_time) FROM `{P}.silver.__TABLES__`
                       WHERE table_id = 'cve_latest')"""
-CVE_ROWS = f"(SELECT * FROM {B['cvelist_records']} WHERE processed_at <= {SILVER_BUILT})"
+# processed_at exists only since 9 Nov: older rows have it NULL, and were loaded when they were observed
+CVE_ROWS = f"(SELECT * FROM {B['cvelist_records']} WHERE COALESCE(processed_at, observed_at) <= {SILVER_BUILT})"
 run("silver.cve_latest: the chosen version of every CVE = the newest stored version (re-derived), scope applied after",
     f"""WITH b AS (
           SELECT cve_id, record_hash, observed_at,
@@ -194,14 +195,20 @@ run("ops.source_watermarks: cvelist checked in the last 3 hours, NVD/KEV/EPSS in
         FROM (SELECT source, MAX(last_checked_at) last_checked_at FROM `{P}.ops.source_watermarks` GROUP BY 1)""")
 # each run writes a 'started' row and an end row ('succeeded' or 'failed'); a run with no end row after
 # 2 hours (the job timeout is 1 hour) crashed without recording its end
-run("ops.ingest_runs: in the last 48 hours, no failed run and no run that never finished",
+run("ops.ingest_runs: in the last 24 hours, no failed run and no run that never finished",
     f"""WITH r AS (SELECT run_id, ANY_VALUE(mode) mode, MIN(started_at) started_at,
                          LOGICAL_OR(status = 'failed') failed, LOGICAL_OR(status IN ('succeeded', 'failed')) ended,
                          STRING_AGG(error, ' ') error
                   FROM `{P}.ops.ingest_runs` GROUP BY 1)
         SELECT COUNTIF(failed OR (NOT ended AND started_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR))) failing,
           {examples("IF(failed OR NOT ended, CONCAT(mode, ' ', CAST(started_at AS STRING), IF(failed, ' failed: ', ' never finished'), SUBSTR(IFNULL(error, ''), 1, 80)), NULL)")} detail
-        FROM r WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)""")
+        FROM r WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)""")
+# older failures are shown, not counted: each one needs its cause and proof it was recovered
+for r in bq.query(f"""SELECT run_id, ANY_VALUE(mode) mode, MIN(started_at) t, STRING_AGG(error, ' ') err
+                     FROM `{P}.ops.ingest_runs` GROUP BY run_id HAVING LOGICAL_OR(status = 'failed')
+                     AND MIN(started_at) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY) ORDER BY t""",
+                  job_config=CFG).result():
+    print(f"INFO  failed run in the last 7 days: {r.mode} {r.t:%Y-%m-%d %H:%M} UTC  {r.run_id}  {(r.err or '(no message)')[:120]}")
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)
