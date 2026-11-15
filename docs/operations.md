@@ -26,7 +26,7 @@ sequenceDiagram
 |---|---|---|
 | `loaded` | Complete and stored | Continues |
 | `unchanged` | Same file seen again | Continues |
-| `partial` | Some records unreadable. The good ones are stored. Gold is blocked until a later complete baseline. | Fails |
+| `partial` | Some records unreadable; the good ones are stored. A partial source load fails the run. For cvelist, publication remains blocked until the configured recovery condition (a later complete baseline) is met. | Fails |
 | `quarantined` | Too many unreadable records | Fails |
 | `conflicts` | EPSS only: a different value for an existing `(cve_id, score_date)`. Nothing is inserted. | Fails |
 | `invalid` | NVD page fails the envelope or record checks | Fails; no watermark |
@@ -34,7 +34,7 @@ sequenceDiagram
 A lock older than 3 hours is treated as stale.
 
 ## Run modes
-The Cloud Run Job reads `MODE` from its environment. Cloud Scheduler sets it per schedule.
+The extractor uses the first command-line argument as its mode, falling back to the `MODE` environment variable. Cloud Scheduler supplies the mode through container argument overrides.
 
 | Mode | What it does | Started by |
 |---|---|---|
@@ -52,7 +52,10 @@ The Cloud Run Job reads `MODE` from its environment. Cloud Scheduler sets it per
 
 **Run a mode by hand:**
 ```bash
-gcloud run jobs execute vuln-extractor --region=us-central1 --update-env-vars=MODE=epss_backfill
+gcloud run jobs execute vuln-extractor \
+  --project=vuln-intel-warehouse \
+  --region=us-central1 \
+  --args=epss_backfill
 ```
 
 **Do not run manual transformations** (`infra/dataform_run.sh`) **or snapshot-sensitive verification while a daily execution is active.** They write to, or read, the same tables.
@@ -110,10 +113,10 @@ This is an outline of how the project was deployed, not a one-command setup.
    - Create the Cloud Run Job `vuln-extractor` from that image: runs as `extractor-sa`, 1 vCPU / 4 GiB, 1-hour timeout, 1 retry. Set the environment `GOOGLE_CLOUD_PROJECT`, `REGION`, `BUCKET`, `COHORT_START` and `DATAFORM_REPO`, and `NVD_API_KEY` from the secret.
 6. `bash infra/job_iam.sh`: the roles that need the job to exist.
 7. **Console:** create the Dataform repository `vuln-intel-dataform`, linked to the GitHub repository (`main`). Then run `bash infra/dataform_iam.sh` for its identity and BigQuery roles.
-8. **Initial loads, before the schedules.** Run them by hand with `gcloud run jobs execute`:
+8. **Initial loads, before the schedules.** Run them by hand with `gcloud run jobs execute … --args=<mode>`:
    - `cvelist_baseline`;
    - `nvd` (with no watermark, it starts from the cohort start);
    - `kev`;
    - `epss_backfill`.
-9. **Run Dataform once** (`MODE=dataform`). Check the result with `bash infra/check_quality.sh` and `bash infra/verify_all.sh`.
+9. **Run Dataform once** (`--args=dataform`). Check the result with `bash infra/check_quality.sh` and `bash infra/verify_all.sh`.
 10. `bash infra/scheduler.sh`: the three schedules.

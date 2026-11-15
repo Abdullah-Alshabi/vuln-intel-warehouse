@@ -31,4 +31,4 @@ BigQuery and the dashboard showed the same numbers:
 - **Total:** 21,393, and the sum over publication days is also 21,393.
 - **P1:** 27.
 - **Priorities:** 27 + 3 + 1,895 + 19,468 = 21,393.
-- **Filtering on P1** changed every element to 27.
+- **Filtering on P1** restricted all visuals to the same 27 CVEs. The total and the KEV count both showed 27; percentages and charts recalculated within that filtered set.
